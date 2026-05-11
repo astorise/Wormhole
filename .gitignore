@@ -1,0 +1,15 @@
+**/target/*
+**/node_modules/*
+**/bin/*
+**/obj/*
+*.log
+**/.env.local
+**/.env.*.local
+.codex-tmp/*
+.vscode/*
+
+artifacts/*
+
+# Local runtime artifacts; never committed.
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

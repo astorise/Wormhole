@@ -1,0 +1,34 @@
+[package]
+name = "wormhole-relay"
+version = "0.1.0"
+edition = "2021"
+description = "Wormhole FaaS relay — stateless QUIC router for Tachyon-Mesh"
+license = "MIT"
+
+[[bin]]
+name = "wormhole-relay"
+path = "src/main.rs"
+
+[lib]
+name = "wormhole_relay"
+path = "src/lib.rs"
+
+[dependencies]
+quinn = "0.11"
+rustls = { version = "0.23", features = ["ring"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+dashmap = "6"
+rcgen = "0.13"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

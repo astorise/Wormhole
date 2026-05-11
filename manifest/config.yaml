@@ -1,0 +1,38 @@
+name: wormhole-core
+version: 0.1.0
+description: Universal L4 transport tunnel over QUIC with end-to-end mTLS
+
+capabilities:
+  - id: MultiProtocolTransport
+    description: Transparently tunnels TCP and UDP streams through a QUIC conduit
+    protocols:
+      - tcp
+      - udp
+
+alpn:
+  - wormhole/1
+  - h3
+
+routing:
+  strategy: sni-passthrough
+  description: >
+    The relay routes incoming connections to the correct QUIC tunnel
+    based on SNI or Connection ID without decrypting the payload.
+
+components:
+  relay:
+    language: rust
+    target: wasm32-wasi
+    package: faas
+    entrypoint: faas/src/main.rs
+
+  client:
+    language: nodejs
+    package: cli
+    entrypoint: cli/src/index.js
+    bin: wormhole
+
+tachyon:
+  mesh: true
+  faas: true
+  region: edge
