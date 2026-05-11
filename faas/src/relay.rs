@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::router::Router;
 use crate::tls;
@@ -19,16 +19,17 @@ pub struct TachyonSocket;
 pub struct Relay {
     endpoint: Endpoint,
     router: Arc<Router>,
-    /// When `true`, client certificates are required and the extracted SAN
-    /// is used as the `tunnel_key`.  Connections without a valid certificate
-    /// are rejected immediately.
+    /// mTLS enforced: client certs required, SAN used as tunnel key.
     mtls: bool,
+    /// Explicit unsecure opt-in: no client auth, SNI used as key, warning emitted.
+    allow_insecure: bool,
 }
 
 impl Relay {
     pub async fn new(
         source: SocketSource,
         ca_cert: Option<rustls::pki_types::CertificateDer<'static>>,
+        allow_insecure: bool,
     ) -> Result<Self> {
         let mtls = ca_cert.is_some();
 
@@ -62,7 +63,15 @@ impl Relay {
             SocketSource::Bind(addr) => {
                 let ep = Endpoint::server(server_config, addr)
                     .context("failed to bind QUIC endpoint")?;
-                info!(addr = %addr, mtls, "QUIC relay listening");
+                if allow_insecure {
+                    error!(
+                        addr = %addr,
+                        "⚠ RELAY RUNNING IN UNSECURE MODE — no client authentication, \
+                         SNI spoofing possible. Set WORMHOLE_CA_CERT to enable mTLS."
+                    );
+                } else {
+                    info!(addr = %addr, mtls, "QUIC relay listening");
+                }
                 ep
             }
             SocketSource::Tachyon(_sock) => {
@@ -74,22 +83,29 @@ impl Relay {
             endpoint,
             router: Arc::new(Router::new()),
             mtls,
+            allow_insecure,
         })
     }
 
-    /// Convenience constructor — no mTLS (useful for tests and local dev).
+    /// Convenience constructor — no mTLS (tests / local dev, no warning).
     pub async fn bind(addr: &str) -> Result<Self> {
         let addr: SocketAddr = addr.parse().context("invalid bind address")?;
-        Self::new(SocketSource::Bind(addr), None).await
+        Self::new(SocketSource::Bind(addr), None, false).await
     }
 
-    /// Constructor with mTLS enforced against the provided CA certificate.
+    /// Unsecure mode: no client auth, but emits a prominent warning on startup.
+    pub async fn bind_unsecure(addr: &str) -> Result<Self> {
+        let addr: SocketAddr = addr.parse().context("invalid bind address")?;
+        Self::new(SocketSource::Bind(addr), None, true).await
+    }
+
+    /// mTLS enforced: client certs must chain to the provided CA.
     pub async fn bind_with_mtls(
         addr: &str,
         ca_cert: rustls::pki_types::CertificateDer<'static>,
     ) -> Result<Self> {
         let addr: SocketAddr = addr.parse().context("invalid bind address")?;
-        Self::new(SocketSource::Bind(addr), Some(ca_cert)).await
+        Self::new(SocketSource::Bind(addr), Some(ca_cert), false).await
     }
 
     pub fn router(&self) -> Arc<Router> {
@@ -104,14 +120,13 @@ impl Relay {
 
     pub async fn run(self, public_socket: Arc<UdpSocket>) -> Result<()> {
         let mtls = self.mtls;
+        let allow_insecure = self.allow_insecure;
         while let Some(incoming) = self.endpoint.accept().await {
             let router = Arc::clone(&self.router);
             let socket = Arc::clone(&public_socket);
             tokio::spawn(async move {
                 match incoming.await {
                     Ok(conn) => {
-                        // Derive the tunnel key from the verified client identity
-                        // when mTLS is active; fall back to SNI otherwise.
                         let key = if mtls {
                             match extract_client_san(&conn) {
                                 Some(san) => san,
@@ -128,13 +143,23 @@ impl Relay {
                                 }
                             }
                         } else {
-                            // No mTLS: use SNI or stable connection ID as key.
-                            conn.handshake_data()
+                            // Unsecure / dev mode: trust the unverified SNI.
+                            // In allow_insecure mode this is explicitly acknowledged.
+                            let key = conn
+                                .handshake_data()
                                 .and_then(|d| {
                                     d.downcast::<quinn::crypto::rustls::HandshakeData>().ok()
                                 })
                                 .and_then(|hd| hd.server_name.clone())
-                                .unwrap_or_else(|| conn.stable_id().to_string())
+                                .unwrap_or_else(|| conn.stable_id().to_string());
+                            if allow_insecure {
+                                warn!(
+                                    key = %key,
+                                    remote = %conn.remote_address(),
+                                    "accepting unauthenticated tunnel (unsecure mode)"
+                                );
+                            }
+                            key
                         };
 
                         info!(key = %key, remote = %conn.remote_address(), "client tunnel connected");

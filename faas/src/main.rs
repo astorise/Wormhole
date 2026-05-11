@@ -16,14 +16,19 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let relay = match std::env::var("WORMHOLE_CA_CERT").ok() {
-        Some(path) => {
-            let pem = std::fs::read(&path)
-                .with_context(|| format!("failed to read CA cert from {path}"))?;
-            let ca_cert = load_ca_cert_from_pem(&pem)?;
-            Relay::bind_with_mtls("0.0.0.0:4433", ca_cert).await?
-        }
-        None => Relay::bind("0.0.0.0:4433").await?,
+    // Priority: mTLS > explicit unsecure > silent dev mode (no warning).
+    let relay = if let Ok(path) = std::env::var("WORMHOLE_CA_CERT") {
+        let pem =
+            std::fs::read(&path).with_context(|| format!("failed to read CA cert from {path}"))?;
+        let ca_cert = load_ca_cert_from_pem(&pem)?;
+        Relay::bind_with_mtls("0.0.0.0:4433", ca_cert).await?
+    } else if std::env::var("WORMHOLE_UNSECURE")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+    {
+        Relay::bind_unsecure("0.0.0.0:4433").await?
+    } else {
+        Relay::bind("0.0.0.0:4433").await?
     };
 
     // Grab a cloned endpoint handle *before* consuming `relay` in `run()`.

@@ -208,8 +208,10 @@ export function loadTlsConfig(auth, caPath) {
   const config = { rejectUnauthorized: !!auth };
 
   if (auth) {
-    config.cert = readFileSync(auth.cert);
-    config.key = readFileSync(auth.key);
+    // auth.raw === true when the cert/key are PEM strings (auto-generated or
+    // discovered from ~/.ssh/). Otherwise they are file paths to read.
+    config.cert = auth.raw ? Buffer.from(auth.cert) : readFileSync(auth.cert);
+    config.key = auth.raw ? Buffer.from(auth.key) : readFileSync(auth.key);
   }
 
   if (caPath) {
