@@ -1,6 +1,6 @@
 {
   "name": "@tachyon-mesh/wormhole",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Universal L4 transport tunnel over QUIC with end-to-end mTLS",
   "type": "module",
   "main": "./src/index.js",
@@ -20,7 +20,8 @@
     "node": ">=20"
   },
   "dependencies": {
-    "commander": "^12.0.0"
+    "commander": "^12.0.0",
+    "@fails-components/webtransport": "^0.1.16"
   },
   "devDependencies": {
     "esbuild": "^0.24.0"

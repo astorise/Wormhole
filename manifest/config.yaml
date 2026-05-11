@@ -1,5 +1,5 @@
 name: wormhole-core
-version: 0.1.0
+version: 0.2.0
 description: Universal L4 transport tunnel over QUIC with end-to-end mTLS
 
 capabilities:
@@ -18,13 +18,20 @@ routing:
   description: >
     The relay routes incoming connections to the correct QUIC tunnel
     based on SNI or Connection ID without decrypting the payload.
+  affinity:
+    # Gateway Steering: the Tachyon gateway pins each SNI/Connection-ID to the
+    # specific worker instance holding the in-memory DashMap routing table.
+    mode: l4-sticky
+    key: sni            # primary key: TLS SNI hostname
+    fallback: quic-cid  # secondary key: QUIC Connection ID
 
 components:
   relay:
     language: rust
-    target: wasm32-wasi
+    target: wasm32-wasip1
     package: faas
     entrypoint: faas/src/main.rs
+    execution_mode: worker  # long-lived process; tokio keeps QUIC connections alive
 
   client:
     language: nodejs
@@ -36,3 +43,11 @@ tachyon:
   mesh: true
   faas: true
   region: edge
+  gateway:
+    steering: affinity
+    protocol: l4
+  virtual_socket:
+    # The relay must accept sockets from Tachyon's Virtual Socket Layer
+    # (accelerator-host.wit) rather than binding OS UDP sockets directly.
+    enabled: true
+    wit: accelerator-host

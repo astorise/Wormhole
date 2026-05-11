@@ -1,106 +1,100 @@
-import { createSocket } from 'node:dgram';
 import { readFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
+import { Http3WebTransport } from '@fails-components/webtransport';
 
 /**
- * Minimal QUIC dialer built on Node.js native dgram.
- * In production this would delegate to a native QUIC library (e.g. node-quic,
- * @fails-components/webtransport, or the upcoming net.createQUICSocket API).
- * This implementation provides the structural contract used by Wormhole.
+ * QUIC dialer built on the WebTransport API (@fails-components/webtransport).
+ * Each call to openStream() opens a bidirectional WebTransport stream, which
+ * maps to a QUIC bidirectional stream on the underlying connection.
  */
 export class QuicDialer extends EventEmitter {
-  #socket;
-  #relayHost;
-  #relayPort;
-  #connected = false;
-  #streams = new Map();
-  #nextStreamId = 1;
+  #transport = null;
+  #relayUrl;
+  #tlsConfig;
 
   constructor({ relayHost, relayPort, tlsConfig }) {
     super();
-    this.#relayHost = relayHost;
-    this.#relayPort = relayPort;
-    this._tlsConfig = tlsConfig;
+    this.#relayUrl = `https://${relayHost}:${relayPort}/wormhole`;
+    this.#tlsConfig = tlsConfig;
   }
 
-  /** Establish the persistent outbound QUIC connection to the relay. */
+  get connected() {
+    return this.#transport !== null;
+  }
+
+  /** Establish the persistent outbound QUIC/WebTransport session. */
   async connect() {
-    this.#socket = createSocket('udp4');
+    const opts = {
+      serverCertificateHashes: this.#tlsConfig.serverCertHashes ?? [],
+    };
 
-    await new Promise((resolve, reject) => {
-      this.#socket.bind(0, () => resolve());
-      this.#socket.once('error', reject);
-    });
+    if (this.#tlsConfig.cert && this.#tlsConfig.key) {
+      // mTLS: pass client cert/key when the relay requires client auth.
+      opts.clientCertificate = {
+        certificate: this.#tlsConfig.cert,
+        privateKey: this.#tlsConfig.key,
+      };
+    }
 
-    this.#socket.on('message', (msg) => this._onMessage(msg));
-
-    // Send QUIC Initial packet (placeholder — real impl uses QUIC crypto)
-    const initPacket = this._buildInitPacket();
-    await this._send(initPacket);
-
-    this.#connected = true;
+    this.#transport = new Http3WebTransport(this.#relayUrl, opts);
+    await this.#transport.ready;
     this.emit('connected');
   }
 
-  /** Open a bidirectional stream over the QUIC connection. */
-  openStream() {
-    if (!this.#connected) throw new Error('not connected');
-    const id = this.#nextStreamId++;
-    const stream = new QuicStream(id, (data) => this._sendStream(id, data));
-    this.#streams.set(id, stream);
-    return stream;
+  /** Open a bidirectional QUIC stream over the active session. */
+  async openStream() {
+    if (!this.#transport) throw new Error('not connected');
+    const { readable, writable } = await this.#transport.createBidirectionalStream();
+    return new QuicStream(readable, writable);
+  }
+
+  /** Send a datagram (UDP encapsulation). */
+  async sendDatagram(data) {
+    if (!this.#transport) throw new Error('not connected');
+    await this.#transport.datagrams.writable.getWriter().write(data);
+  }
+
+  /** Subscribe to incoming datagrams from the relay. */
+  get datagramReader() {
+    return this.#transport?.datagrams.readable;
   }
 
   close() {
-    this.#connected = false;
-    this.#socket?.close();
+    this.#transport?.close();
+    this.#transport = null;
     this.emit('closed');
-  }
-
-  get connected() { return this.#connected; }
-
-  _onMessage(msg) {
-    const streamId = msg.readUInt32BE(0);
-    const payload = msg.subarray(4);
-    this.#streams.get(streamId)?.push(payload);
-  }
-
-  _buildInitPacket() {
-    const buf = Buffer.alloc(4);
-    buf.write('INIT');
-    return buf;
-  }
-
-  async _send(data) {
-    return new Promise((resolve, reject) => {
-      this.#socket.send(data, this.#relayPort, this.#relayHost, (err) => {
-        if (err) reject(err); else resolve();
-      });
-    });
-  }
-
-  async _sendStream(streamId, data) {
-    const header = Buffer.alloc(4);
-    header.writeUInt32BE(streamId, 0);
-    await this._send(Buffer.concat([header, data]));
   }
 }
 
 export class QuicStream extends EventEmitter {
-  #id;
-  #send;
+  #readable;
+  #writable;
+  #writer;
 
-  constructor(id, send) {
+  constructor(readable, writable) {
     super();
-    this.#id = id;
-    this.#send = send;
+    this.#readable = readable;
+    this.#writable = writable;
+    this.#writer = writable.getWriter();
+    this._pump();
   }
 
-  push(data) { this.emit('data', data); }
+  async _pump() {
+    const reader = this.#readable.getReader();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) { this.emit('end'); break; }
+        this.emit('data', Buffer.from(value));
+      }
+    } catch (e) {
+      this.emit('error', e);
+    }
+  }
 
-  write(data) { return this.#send(Buffer.from(data)); }
+  write(data) { return this.#writer.write(data instanceof Buffer ? data : Buffer.from(data)); }
 
-  get id() { return this.#id; }
+  async close() { await this.#writer.close(); }
 }
 
 /** Load mTLS config from cert/key PEM files. */

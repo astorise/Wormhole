@@ -1,7 +1,8 @@
 use dashmap::DashMap;
 use quinn::Connection;
 use std::sync::Arc;
-use tokio::io::copy_bidirectional;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 /// Maps SNI hostname → active client QUIC connection (the outbound tunnel).
@@ -16,35 +17,50 @@ impl Router {
         }
     }
 
-    /// Register a new client tunnel. If the client presented an SNI, index by it;
-    /// otherwise use the stable connection ID as a fallback key.
+    /// Register a new client tunnel keyed by SNI or stable connection ID.
     pub async fn register(&self, conn: Connection, sni: Option<String>) {
         let key = sni.unwrap_or_else(|| conn.stable_id().to_string());
         info!(key = %key, "tunnel registered");
         self.table.insert(key, conn);
     }
 
-    /// Route an incoming remote caller's bi-directional stream to the correct
-    /// client tunnel identified by `sni`. Streams are bridged without touching
-    /// the encrypted payload — pure pass-through at L4.
-    pub async fn route(
-        self: &Arc<Self>,
-        sni: &str,
-        mut incoming: (impl tokio::io::AsyncRead + Unpin, impl tokio::io::AsyncWrite + Unpin),
-    ) {
+    /// Route an ingress TCP stream into the matching client QUIC tunnel.
+    ///
+    /// `initial` contains the bytes already read (the TLS ClientHello fragment).
+    /// They are forwarded to the QUIC send stream first so the client sees the
+    /// full, unmodified byte sequence. The rest is then bridged bidirectionally:
+    ///   TCP read  → QUIC SendStream
+    ///   QUIC RecvStream → TCP write
+    pub async fn route_ingress(&self, sni: &str, initial: &[u8], stream: TcpStream) {
         let Some(client_conn) = self.table.get(sni).map(|e| e.clone()) else {
-            warn!(sni = %sni, "no tunnel registered for SNI");
+            warn!(sni = %sni, "no tunnel registered for SNI — dropping connection");
             return;
         };
 
-        match client_conn.open_bi().await {
-            Ok((mut send, mut recv)) => {
-                debug!(sni = %sni, "bridging stream");
-                let _ = copy_bidirectional(&mut incoming.0, &mut send).await;
-                drop(recv);
+        let (mut quic_send, mut quic_recv) = match client_conn.open_bi().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(sni = %sni, err = %e, "failed to open stream on client tunnel");
+                return;
             }
-            Err(e) => warn!(sni = %sni, err = %e, "failed to open stream to client"),
+        };
+
+        // Write the already-read ClientHello bytes before bridging.
+        if let Err(e) = quic_send.write_all(initial).await {
+            warn!(sni = %sni, err = %e, "failed to write initial bytes to QUIC stream");
+            return;
         }
+
+        debug!(sni = %sni, "bridging ingress stream to client tunnel");
+
+        // Split TcpStream so we can drive two independent copy directions.
+        let (mut tcp_read, mut tcp_write) = stream.into_split();
+
+        // TCP→QUIC and QUIC→TCP run concurrently; stop when either direction ends.
+        let _ = tokio::join!(
+            tokio::io::copy(&mut tcp_read, &mut quic_send),
+            tokio::io::copy(&mut quic_recv, &mut tcp_write),
+        );
     }
 
     pub fn active_tunnels(&self) -> usize {

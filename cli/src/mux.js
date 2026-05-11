@@ -3,9 +3,10 @@ import * as dgram from 'node:dgram';
 import { EventEmitter } from 'node:events';
 
 /**
- * Bridges local TCP/UDP ports to QUIC streams opened over the tunnel.
- * Each local connection/datagram gets its own QUIC stream (bidirectional for TCP,
- * unidirectional datagram encapsulation for UDP).
+ * Bridges local TCP/UDP ports to QUIC streams/datagrams over the WebTransport tunnel.
+ *
+ * TCP: each local connection → one bidirectional WebTransport stream.
+ * UDP: each local datagram → one WebTransport datagram (length-prefixed frame).
  */
 export class Multiplexer extends EventEmitter {
   #dialer;
@@ -16,15 +17,24 @@ export class Multiplexer extends EventEmitter {
     this.#dialer = dialer;
   }
 
-  /** Start bridging a local TCP port over the QUIC tunnel. */
+  /** Bridge a local TCP port: each accepted connection → a new QUIC stream. */
   async bindTcp(localPort) {
-    const server = net.createServer((socket) => {
-      const stream = this.#dialer.openStream();
+    const server = net.createServer(async (socket) => {
+      let stream;
+      try {
+        stream = await this.#dialer.openStream();
+      } catch (e) {
+        socket.destroy(e);
+        return;
+      }
 
+      // local → relay
       socket.on('data', (chunk) => stream.write(chunk));
-      stream.on('data', (chunk) => socket.write(chunk));
+      // relay → local
+      stream.on('data', (chunk) => { if (!socket.destroyed) socket.write(chunk); });
 
-      socket.once('end', () => stream.emit('end'));
+      stream.on('end', () => socket.end());
+      socket.once('close', () => stream.close().catch(() => {}));
       socket.once('error', () => socket.destroy());
     });
 
@@ -38,25 +48,39 @@ export class Multiplexer extends EventEmitter {
     return server;
   }
 
-  /** Start bridging a local UDP port over the QUIC tunnel. */
+  /** Bridge a local UDP port: each datagram → a WebTransport datagram. */
   async bindUdp(localPort) {
     const socket = dgram.createSocket('udp4');
+    const sessions = new Map(); // "ip:port" → last seen rinfo
 
-    socket.on('message', (msg, rinfo) => {
-      const stream = this.#dialer.openStream();
-      // Encapsulate UDP datagram: 2-byte length prefix + payload
+    socket.on('message', async (msg, rinfo) => {
+      const key = `${rinfo.address}:${rinfo.port}`;
+      sessions.set(key, rinfo);
+
+      // 2-byte length prefix + payload
       const frame = Buffer.alloc(2 + msg.length);
       frame.writeUInt16BE(msg.length, 0);
       msg.copy(frame, 2);
-      stream.write(frame);
-
-      // Return path: relay sends framed response back
-      stream.on('data', (data) => {
-        const len = data.readUInt16BE(0);
-        const payload = data.subarray(2, 2 + len);
-        socket.send(payload, rinfo.port, rinfo.address);
-      });
+      await this.#dialer.sendDatagram(frame).catch(() => {});
     });
+
+    // Pump incoming relay datagrams back to local clients
+    if (this.#dialer.datagramReader) {
+      (async () => {
+        const reader = this.#dialer.datagramReader.getReader();
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          const data = Buffer.from(value);
+          const len = data.readUInt16BE(0);
+          const payload = data.subarray(2, 2 + len);
+          // Broadcast to all active sessions (UDP is connectionless)
+          for (const rinfo of sessions.values()) {
+            socket.send(payload, rinfo.port, rinfo.address);
+          }
+        }
+      })().catch(() => {});
+    }
 
     await new Promise((resolve, reject) => {
       socket.bind(localPort, '127.0.0.1', resolve);

@@ -1,6 +1,8 @@
 use anyhow::Result;
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
-use wormhole_relay::relay::Relay;
+
+use wormhole_relay::{ingress::Ingress, relay::Relay};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -8,6 +10,15 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let relay = Relay::new("0.0.0.0:4433").await?;
-    relay.run().await
+    let relay = Relay::bind("0.0.0.0:4433").await?;
+    let router = relay.router();
+    let ingress = Ingress::new("0.0.0.0:443", Arc::clone(&router)).await?;
+
+    // Run both planes concurrently; stop the process if either one exits.
+    tokio::select! {
+        res = relay.run()   => res?,
+        res = ingress.run() => res?,
+    }
+
+    Ok(())
 }
