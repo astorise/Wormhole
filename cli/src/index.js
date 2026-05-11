@@ -41,12 +41,12 @@ export class Wormhole {
    * @returns {Promise<Wormhole>}
    */
   static async create(opts) {
-    const { relay, targets = [], sni, auth } = opts;
+    const { relay, targets = [], sni, auth, ca } = opts;
 
     const [relayHost, relayPortStr] = relay.split(':');
     const relayPort = parseInt(relayPortStr ?? '4433', 10);
 
-    const tlsConfig = loadTlsConfig(auth);
+    const tlsConfig = loadTlsConfig(auth, ca);
     const dialer = new QuicDialer({ relayHost, relayPort, tlsConfig });
 
     await dialer.connect();

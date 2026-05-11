@@ -7,12 +7,13 @@ const program = new Command();
 program
   .name('wormhole')
   .description('Universal L4 transport tunnel over QUIC with end-to-end mTLS')
-  .version('0.1.0')
+  .version('0.2.0')
   .requiredOption('--relay <url>', 'Relay server URL (e.g. relay.tachyon.io:4433)')
   .option('--tcp <port>', 'Local TCP port to expose', (v) => parseInt(v, 10))
   .option('--udp <port>', 'Local UDP port to expose', (v) => parseInt(v, 10))
   .option('--cert <path>', 'Path to client certificate (.pem)')
   .option('--key <path>', 'Path to client private key (.pem)')
+  .option('--ca <path>', 'Path to relay CA certificate (.pem) — pins relay trust anchor, prevents MITM')
   .option('--sni <name>', 'SNI hostname to advertise to the relay')
   .action(async (opts) => {
     const targets = [];
@@ -29,6 +30,7 @@ program
       targets,
       sni: opts.sni,
       auth: opts.cert && opts.key ? { cert: opts.cert, key: opts.key } : undefined,
+      ca: opts.ca,
     });
 
     console.log(`Wormhole open: ${tunnel.endpoint}`);

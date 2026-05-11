@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 
 const BACKOFF_BASE_MS = 500;
@@ -179,12 +180,42 @@ export class QuicStream extends EventEmitter {
   }
 }
 
-/** Load mTLS config from cert/key PEM files. */
-export function loadTlsConfig(auth) {
-  if (!auth) return { rejectUnauthorized: false };
-  return {
-    cert: readFileSync(auth.cert),
-    key: readFileSync(auth.key),
-    rejectUnauthorized: true,
-  };
+/**
+ * Build the TLS configuration object for the QUIC dialer.
+ *
+ * @param {{ cert: string, key: string } | undefined} auth - Client cert/key paths for mTLS.
+ * @param {string | undefined} caPath - Path to the relay's CA certificate (.pem).
+ *   When provided, its SHA-256 fingerprint is added to `serverCertificateHashes`
+ *   so the WebTransport client pins that trust anchor and rejects any relay cert
+ *   not signed by it (prevents MITM).
+ */
+export function loadTlsConfig(auth, caPath) {
+  const config = { rejectUnauthorized: !!auth };
+
+  if (auth) {
+    config.cert = readFileSync(auth.cert);
+    config.key = readFileSync(auth.key);
+  }
+
+  if (caPath) {
+    const caDer = parsePemToDer(readFileSync(caPath));
+    const hash = createHash('sha-256').update(caDer).digest();
+    config.serverCertHashes = [{ algorithm: 'sha-256', value: hash }];
+  }
+
+  return config;
+}
+
+/**
+ * Strip PEM armour and return the raw DER bytes of the first certificate.
+ * @param {Buffer} pem
+ * @returns {Buffer}
+ */
+function parsePemToDer(pem) {
+  const b64 = pem
+    .toString('ascii')
+    .split('\n')
+    .filter((l) => !l.startsWith('-----'))
+    .join('');
+  return Buffer.from(b64, 'base64');
 }

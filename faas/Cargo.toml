@@ -24,6 +24,8 @@ bytes = "1"
 dashmap = "6"
 rcgen = "0.13"
 tls-parser = "0.12"
+x509-parser = "0.15"
+rustls-pemfile = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"
