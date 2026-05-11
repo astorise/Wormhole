@@ -67,6 +67,13 @@ impl Router {
         );
     }
 
+    /// Remove a dead tunnel from the routing table to free memory.
+    pub fn unregister(&self, key: &str) {
+        if self.table.remove(key).is_some() {
+            info!(key = %key, "tunnel unregistered");
+        }
+    }
+
     pub fn active_tunnels(&self) -> usize {
         self.table.len()
     }

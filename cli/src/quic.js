@@ -1,15 +1,27 @@
 import { readFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 
+const BACKOFF_BASE_MS = 500;
+const BACKOFF_MAX_MS = 30_000;
+const KEEPALIVE_INTERVAL_MS = 15_000;
+const PING = Buffer.from([0x01]); // 1-byte keep-alive payload
+
 /**
  * QUIC dialer backed by @fails-components/webtransport (libquiche).
- * The package is loaded lazily inside connect() so the module can be imported
- * in tests without triggering the native addon load.
+ * Supports exponential-backoff auto-reconnect and a periodic keep-alive ping.
+ *
+ * Events:
+ *   connected     — session established (initial or after reconnect)
+ *   reconnecting  — attempting to reconnect after a drop (detail: { attempt, delayMs })
+ *   reconnected   — session re-established after a drop
+ *   closed        — permanently closed (close() was called)
  */
 export class QuicDialer extends EventEmitter {
   #transport = null;
   #relayUrl;
   #tlsConfig;
+  #stopped = false;
+  #keepAliveTimer = null;
 
   constructor({ relayHost, relayPort, tlsConfig }) {
     super();
@@ -21,15 +33,13 @@ export class QuicDialer extends EventEmitter {
     return this.#transport !== null;
   }
 
-  /** Establish the persistent outbound QUIC/WebTransport session. */
+  /** One-shot connect (no retry). Used internally and for unit tests. */
   async connect() {
-    // Dynamic import avoids loading the native addon at module parse time.
     const { Http3WebTransport } = await import('@fails-components/webtransport');
 
     const opts = {
       serverCertificateHashes: this.#tlsConfig.serverCertHashes ?? [],
     };
-
     if (this.#tlsConfig.cert && this.#tlsConfig.key) {
       opts.clientCertificate = {
         certificate: this.#tlsConfig.cert,
@@ -39,7 +49,54 @@ export class QuicDialer extends EventEmitter {
 
     this.#transport = new Http3WebTransport(this.#relayUrl, opts);
     await this.#transport.ready;
+    this.#startKeepalive();
     this.emit('connected');
+  }
+
+  /**
+   * Connect with exponential backoff.  Keeps retrying until the session is
+   * established or close() is called.  After the first successful connection,
+   * monitors the session and retries on unexpected drops.
+   */
+  async connectWithRetry() {
+    await this.#tryConnect(false);
+
+    // Monitor for unexpected disconnects and auto-reconnect.
+    this.#watchForDrops();
+  }
+
+  async #tryConnect(isReconnect) {
+    let attempt = 0;
+    while (!this.#stopped) {
+      try {
+        await this.connect();
+        if (isReconnect) this.emit('reconnected');
+        return;
+      } catch {
+        if (this.#stopped) return;
+        attempt++;
+        const delayMs = Math.min(BACKOFF_BASE_MS * 2 ** (attempt - 1), BACKOFF_MAX_MS);
+        this.emit('reconnecting', { attempt, delayMs });
+        await this.#sleep(delayMs);
+      }
+    }
+  }
+
+  #watchForDrops() {
+    const checkLoop = async () => {
+      // Poll transport closure; real impl would hook transport.closed promise.
+      const transport = this.#transport;
+      if (!transport) return;
+      try {
+        await transport.closed;
+      } catch { /* expected on drop */ }
+      if (this.#stopped) return;
+      this.#stopKeepalive();
+      this.#transport = null;
+      await this.#tryConnect(true);
+      this.#watchForDrops();
+    };
+    checkLoop().catch(() => {});
   }
 
   /** Open a bidirectional QUIC stream over the active session. */
@@ -61,10 +118,33 @@ export class QuicDialer extends EventEmitter {
     return this.#transport?.datagrams.readable;
   }
 
+  /** Send a periodic 1-byte ping to keep NAT and gateway affinity alive. */
+  #startKeepalive() {
+    this.#stopKeepalive();
+    this.#keepAliveTimer = setInterval(async () => {
+      if (!this.#transport) return;
+      try { await this.sendDatagram(PING); } catch { /* ignore; drop handled by watchForDrops */ }
+    }, KEEPALIVE_INTERVAL_MS);
+    this.#keepAliveTimer.unref?.(); // don't prevent process exit
+  }
+
+  #stopKeepalive() {
+    if (this.#keepAliveTimer) {
+      clearInterval(this.#keepAliveTimer);
+      this.#keepAliveTimer = null;
+    }
+  }
+
   close() {
+    this.#stopped = true;
+    this.#stopKeepalive();
     this.#transport?.close();
     this.#transport = null;
     this.emit('closed');
+  }
+
+  #sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
   }
 }
 
