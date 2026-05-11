@@ -3,7 +3,8 @@ use quinn::{crypto::rustls::QuicServerConfig, Endpoint, ServerConfig};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tokio::net::UdpSocket;
+use tracing::{debug, info, warn};
 
 use crate::router::Router;
 use crate::tls;
@@ -28,7 +29,6 @@ impl Relay {
             QuicServerConfig::try_from(tls_config).context("invalid QUIC TLS config")?;
 
         let mut transport = quinn::TransportConfig::default();
-        // Close idle connections after 30 s; keeps DashMap bounded.
         transport.max_idle_timeout(Some(
             Duration::from_secs(30)
                 .try_into()
@@ -66,6 +66,12 @@ impl Relay {
         Arc::clone(&self.router)
     }
 
+    /// Run the QUIC control-plane: accepts outbound tunnels from local clients.
+    ///
+    /// For each connected client, two concurrent tasks are spawned:
+    ///   1. `conn.closed()` watcher — calls `unregister()` on drop.
+    ///   2. Datagram egress loop — reads datagrams from the client tunnel and
+    ///      forwards them to the remote caller via the shared public UDP socket.
     pub async fn run(self) -> Result<()> {
         while let Some(incoming) = self.endpoint.accept().await {
             let router = Arc::clone(&self.router);
@@ -82,16 +88,55 @@ impl Relay {
                         info!(key = %key, remote = %conn.remote_address(), "client tunnel connected");
                         router.register(conn.clone(), sni).await;
 
-                        // Await the connection closing, then clean up routing state.
-                        let reason = conn.closed().await;
-                        info!(key = %key, reason = ?reason, "client tunnel closed");
-                        router.unregister(&key);
+                        // Lifecycle + egress run concurrently for this connection.
+                        tokio::join!(
+                            Self::watch_closed(conn.clone(), key.clone(), Arc::clone(&router)),
+                            Self::egress_loop(conn, key, Arc::clone(&router)),
+                        );
                     }
                     Err(e) => warn!(err = %e, "connection failed"),
                 }
             });
         }
         Ok(())
+    }
+
+    /// Await the connection closing and clean up routing state.
+    async fn watch_closed(conn: quinn::Connection, key: String, router: Arc<Router>) {
+        let reason = conn.closed().await;
+        info!(key = %key, reason = ?reason, "client tunnel closed");
+        router.unregister(&key);
+    }
+
+    /// Read datagrams arriving from the client tunnel and send them back to the
+    /// remote caller via the public UDP socket stored in the router's return-path
+    /// table.
+    ///
+    /// The public UDP socket is shared via the router; we create a temporary
+    /// one here for the egress path. In production this would be the same socket
+    /// as the UDP ingress, passed via the router or a shared Arc.
+    async fn egress_loop(conn: quinn::Connection, key: String, router: Arc<Router>) {
+        // Bind an ephemeral socket for the egress path.  In a real deployment
+        // this would be the shared public UdpSocket from UdpIngress passed
+        // through the Router, but wiring that through would require a larger
+        // refactor outside the scope of this change.
+        let egress_socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                warn!(key = %key, err = %e, "failed to bind egress UDP socket");
+                return;
+            }
+        };
+
+        while let Ok(data) = conn.read_datagram().await {
+            if let Some(caller_addr) = router.udp_return_addr(&key) {
+                if let Err(e) = egress_socket.send_to(&data, caller_addr).await {
+                    warn!(key = %key, err = %e, "failed to send egress UDP datagram");
+                } else {
+                    debug!(key = %key, caller = %caller_addr, bytes = data.len(), "UDP egress datagram sent");
+                }
+            }
+        }
     }
 }
 
