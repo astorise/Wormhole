@@ -13,8 +13,7 @@
   "scripts": {
     "start": "node src/cli.js",
     "build": "node esbuild.config.js",
-    "test": "node --test test/**/*.test.js",
-    "lint": "eslint src test"
+    "test": "node --test test/**/*.test.js"
   },
   "engines": {
     "node": ">=22"
