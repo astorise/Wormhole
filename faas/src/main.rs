@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
+use std::time::Duration;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use wormhole_relay::{ingress::Ingress, ingress_udp::UdpIngress, relay::Relay};
@@ -14,9 +16,6 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    // Optional: enforce mTLS on the QUIC control plane.
-    // Set WORMHOLE_CA_CERT to a PEM file path to require client certificates
-    // signed by that CA; leave unset for unauthenticated (dev/test) mode.
     let relay = match std::env::var("WORMHOLE_CA_CERT").ok() {
         Some(path) => {
             let pem = std::fs::read(&path)
@@ -27,6 +26,9 @@ async fn main() -> Result<()> {
         None => Relay::bind("0.0.0.0:4433").await?,
     };
 
+    // Grab a cloned endpoint handle *before* consuming `relay` in `run()`.
+    // This lets the shutdown branch close the endpoint gracefully.
+    let ep = relay.endpoint_handle();
     let router = relay.router();
 
     let tcp_ingress = Ingress::new("0.0.0.0:443", Arc::clone(&router)).await?;
@@ -34,12 +36,44 @@ async fn main() -> Result<()> {
     let public_socket = udp_ingress.socket();
 
     tokio::select! {
+        // Graceful shutdown on SIGINT (Ctrl-C) or SIGTERM.
+        _ = shutdown_signal() => {
+            info!("shutdown signal received — sending QUIC GoAway");
+            ep.close(quinn::VarInt::from_u32(0), b"node_shutting_down");
+            // Allow 3 s for in-flight connections to drain.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            info!("graceful shutdown complete");
+        }
         res = relay.run(public_socket)  => res?,
         res = tcp_ingress.run()         => res?,
         res = udp_ingress.run()         => res?,
     }
 
     Ok(())
+}
+
+/// Resolves on SIGINT (Ctrl-C) on all platforms; also listens for SIGTERM
+/// on Unix so process managers (systemd, Docker) can trigger clean shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = async { tokio::signal::ctrl_c().await.unwrap_or(()) };
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).unwrap_or_else(|e| {
+            tracing::warn!(err = %e, "failed to install SIGTERM handler");
+            // Return a stream that never fires by blocking forever.
+            // This is intentional — we only warn, ctrl_c still works.
+            signal(SignalKind::hangup()).expect("SIGHUP fallback")
+        });
+        tokio::select! {
+            _ = ctrl_c       => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await;
 }
 
 fn load_ca_cert_from_pem(pem: &[u8]) -> Result<rustls::pki_types::CertificateDer<'static>> {

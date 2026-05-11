@@ -85,15 +85,30 @@ export class QuicDialer extends EventEmitter {
 
   #watchForDrops() {
     const checkLoop = async () => {
-      // Poll transport closure; real impl would hook transport.closed promise.
       const transport = this.#transport;
       if (!transport) return;
+
+      let closeReason = null;
       try {
-        await transport.closed;
-      } catch { /* expected on drop */ }
+        closeReason = await transport.closed;
+      } catch (err) {
+        closeReason = err;
+      }
+
       if (this.#stopped) return;
       this.#stopKeepalive();
       this.#transport = null;
+
+      // If the relay sent a graceful GoAway (reason "node_shutting_down"),
+      // do not attempt to reconnect — emit 'server_closed' so the caller
+      // can tear down cleanly.
+      const reason = closeReason?.reason ?? closeReason?.message ?? '';
+      if (typeof reason === 'string' && reason.includes('node_shutting_down')) {
+        this.#stopped = true;
+        this.emit('server_closed', { reason });
+        return;
+      }
+
       await this.#tryConnect(true);
       this.#watchForDrops();
     };

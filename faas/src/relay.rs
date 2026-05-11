@@ -45,6 +45,16 @@ impl Relay {
         ));
         transport.keep_alive_interval(Some(Duration::from_secs(15)));
 
+        // QoS: prevent resource exhaustion under heavy LLM load.
+        transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(100));
+        transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+        // 1 MB per-stream receive window; 8 MB connection-level receive window.
+        transport.stream_receive_window(quinn::VarInt::from_u64(1 << 20).expect("valid window"));
+        transport.receive_window(quinn::VarInt::from_u64(1 << 23).expect("valid window"));
+        // 64 KB datagram buffer (ingress); 128 KB datagram send buffer.
+        transport.datagram_receive_buffer_size(Some(1 << 16));
+        transport.datagram_send_buffer_size(1 << 17);
+
         let mut server_config = ServerConfig::with_crypto(Arc::new(quic_config));
         server_config.transport_config(Arc::new(transport));
 
@@ -84,6 +94,12 @@ impl Relay {
 
     pub fn router(&self) -> Arc<Router> {
         Arc::clone(&self.router)
+    }
+
+    /// Return a cloned handle to the underlying QUIC endpoint so callers can
+    /// trigger a graceful shutdown (`endpoint.close(...)`) without consuming `self`.
+    pub fn endpoint_handle(&self) -> quinn::Endpoint {
+        self.endpoint.clone()
     }
 
     pub async fn run(self, public_socket: Arc<UdpSocket>) -> Result<()> {
@@ -150,15 +166,17 @@ impl Relay {
     ) {
         while let Ok(data) = conn.read_datagram().await {
             if let Some(caller_addr) = router.udp_return_addr(&key) {
-                if let Err(e) = public_socket.send_to(&data, caller_addr).await {
-                    warn!(key = %key, err = %e, "failed to send egress UDP datagram");
-                } else {
-                    debug!(
-                        key = %key,
-                        caller = %caller_addr,
-                        bytes = data.len(),
-                        "UDP egress datagram sent"
-                    );
+                match public_socket.send_to(&data, caller_addr).await {
+                    Ok(n) => {
+                        router.record_egress_bytes(n as u64);
+                        debug!(
+                            key = %key,
+                            caller = %caller_addr,
+                            bytes = n,
+                            "UDP egress datagram sent"
+                        );
+                    }
+                    Err(e) => warn!(key = %key, err = %e, "failed to send egress UDP datagram"),
                 }
             }
         }

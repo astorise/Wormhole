@@ -131,6 +131,38 @@ export class Multiplexer extends EventEmitter {
     this.#udpQueue.push(frame);
   }
 
+  /**
+   * Graceful drain: stop accepting new connections on all bound servers
+   * but allow active TCP sockets to finish transferring data before closing.
+   *
+   * @returns {Promise<void>} Resolves when all active TCP sockets are closed.
+   */
+  drain() {
+    // Stop listening (no new connections accepted).
+    for (const srv of this.#servers) {
+      try { srv.close(); } catch { /* already closed / UDP socket */ }
+    }
+    this.#udpQueue.length = 0;
+
+    if (this.#tcpSockets.size === 0) return Promise.resolve();
+
+    return new Promise((resolve) => {
+      let remaining = this.#tcpSockets.size;
+      const onClose = () => {
+        remaining--;
+        if (remaining === 0) resolve();
+      };
+      for (const sock of this.#tcpSockets) {
+        if (sock.destroyed) {
+          onClose();
+        } else {
+          sock.once('close', onClose);
+          sock.end(); // half-close: allow in-flight data to flush
+        }
+      }
+    });
+  }
+
   closeAll() {
     for (const srv of this.#servers) {
       try { srv.close(); } catch { /* already closed */ }

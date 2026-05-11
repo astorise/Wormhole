@@ -55,9 +55,13 @@ impl UdpIngress {
 
             debug!(caller = %caller_addr, dcid = %dcid, bytes = n, "UDP datagram received");
 
-            self.router
+            let forwarded = self
+                .router
                 .route_udp_ingress(&dcid, datagram, caller_addr, Arc::clone(&self.socket))
                 .await;
+            if !forwarded {
+                debug!(dcid = %dcid, "UDP datagram dropped (backpressure)");
+            }
         }
     }
 }

@@ -53,6 +53,13 @@ export class Wormhole {
 
     const mux = new Multiplexer(dialer);
 
+    // When the relay sends a graceful GoAway, drain active connections then exit.
+    dialer.on('server_closed', async ({ reason }) => {
+      console.error(`[wormhole] relay closed: ${reason} — draining connections`);
+      await mux.drain();
+      dialer.close();
+    });
+
     for (const target of targets) {
       if (target.protocol === 'tcp') {
         await mux.bindTcp(target.port);
