@@ -16,9 +16,9 @@ describe('QuicDialer', () => {
     assert.equal(d.connected, false);
   });
 
-  it('throws when opening a stream before connect()', () => {
+  it('rejects when opening a stream before connect()', async () => {
     const d = new QuicDialer({ relayHost: '127.0.0.1', relayPort: 4433, tlsConfig: {} });
-    assert.throws(() => d.openStream(), /not connected/);
+    await assert.rejects(() => d.openStream(), /not connected/);
   });
 });
 

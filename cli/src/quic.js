@@ -1,11 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
-import { Http3WebTransport } from '@fails-components/webtransport';
 
 /**
- * QUIC dialer built on the WebTransport API (@fails-components/webtransport).
- * Each call to openStream() opens a bidirectional WebTransport stream, which
- * maps to a QUIC bidirectional stream on the underlying connection.
+ * QUIC dialer backed by @fails-components/webtransport (libquiche).
+ * The package is loaded lazily inside connect() so the module can be imported
+ * in tests without triggering the native addon load.
  */
 export class QuicDialer extends EventEmitter {
   #transport = null;
@@ -24,12 +23,14 @@ export class QuicDialer extends EventEmitter {
 
   /** Establish the persistent outbound QUIC/WebTransport session. */
   async connect() {
+    // Dynamic import avoids loading the native addon at module parse time.
+    const { Http3WebTransport } = await import('@fails-components/webtransport');
+
     const opts = {
       serverCertificateHashes: this.#tlsConfig.serverCertHashes ?? [],
     };
 
     if (this.#tlsConfig.cert && this.#tlsConfig.key) {
-      // mTLS: pass client cert/key when the relay requires client auth.
       opts.clientCertificate = {
         certificate: this.#tlsConfig.cert,
         privateKey: this.#tlsConfig.key,
@@ -48,13 +49,14 @@ export class QuicDialer extends EventEmitter {
     return new QuicStream(readable, writable);
   }
 
-  /** Send a datagram (UDP encapsulation). */
+  /** Send a UDP-encapsulated datagram to the relay. */
   async sendDatagram(data) {
     if (!this.#transport) throw new Error('not connected');
-    await this.#transport.datagrams.writable.getWriter().write(data);
+    const writer = this.#transport.datagrams.writable.getWriter();
+    await writer.write(data);
+    writer.releaseLock();
   }
 
-  /** Subscribe to incoming datagrams from the relay. */
   get datagramReader() {
     return this.#transport?.datagrams.readable;
   }
@@ -67,20 +69,16 @@ export class QuicDialer extends EventEmitter {
 }
 
 export class QuicStream extends EventEmitter {
-  #readable;
-  #writable;
   #writer;
 
   constructor(readable, writable) {
     super();
-    this.#readable = readable;
-    this.#writable = writable;
     this.#writer = writable.getWriter();
-    this._pump();
+    this._pump(readable);
   }
 
-  async _pump() {
-    const reader = this.#readable.getReader();
+  async _pump(readable) {
+    const reader = readable.getReader();
     try {
       for (;;) {
         const { value, done } = await reader.read();
@@ -92,9 +90,13 @@ export class QuicStream extends EventEmitter {
     }
   }
 
-  write(data) { return this.#writer.write(data instanceof Buffer ? data : Buffer.from(data)); }
+  write(data) {
+    return this.#writer.write(data instanceof Buffer ? data : Buffer.from(data));
+  }
 
-  async close() { await this.#writer.close(); }
+  async close() {
+    await this.#writer.close();
+  }
 }
 
 /** Load mTLS config from cert/key PEM files. */
