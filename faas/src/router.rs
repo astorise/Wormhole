@@ -1,13 +1,17 @@
 use dashmap::DashMap;
 use quinn::Connection;
-use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 /// Maps SNI hostname → active client QUIC connection (the outbound tunnel).
 pub struct Router {
     table: DashMap<String, Connection>,
+}
+
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Router {

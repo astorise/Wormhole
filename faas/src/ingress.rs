@@ -17,7 +17,9 @@ pub struct Ingress {
 impl Ingress {
     pub async fn new(bind_addr: &str, router: Arc<Router>) -> Result<Self> {
         let addr: SocketAddr = bind_addr.parse().context("invalid ingress bind address")?;
-        let listener = TcpListener::bind(addr).await.context("failed to bind ingress TCP")?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .context("failed to bind ingress TCP")?;
         info!(addr = %addr, "TCP ingress listening");
         Ok(Self { listener, router })
     }
@@ -37,7 +39,10 @@ impl Ingress {
 
 async fn handle(mut stream: TcpStream, peer: SocketAddr, router: Arc<Router>) -> Result<()> {
     let mut buf = vec![0u8; PEEK_BUF];
-    let n = stream.read(&mut buf).await.context("failed to read ClientHello")?;
+    let n = stream
+        .read(&mut buf)
+        .await
+        .context("failed to read ClientHello")?;
     buf.truncate(n);
 
     let sni = peek_sni(&buf).unwrap_or_else(|| {
@@ -71,7 +76,8 @@ pub fn peek_sni(buf: &[u8]) -> Option<String> {
         .into_iter()
         .find_map(|ext| {
             if let tls_parser::TlsExtension::SNI(list) = ext {
-                list.first().map(|(_, name)| String::from_utf8_lossy(name).into_owned())
+                list.first()
+                    .map(|(_, name)| String::from_utf8_lossy(name).into_owned())
             } else {
                 None
             }

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use quinn::{Endpoint, ServerConfig};
+use quinn::{crypto::rustls::QuicServerConfig, Endpoint, ServerConfig};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -33,7 +33,9 @@ impl Relay {
     pub async fn new(source: SocketSource) -> Result<Self> {
         let (cert, key) = tls::self_signed_cert()?;
         let tls_config = tls::server_config(cert, key)?;
-        let server_config = ServerConfig::with_crypto(Arc::new(tls_config));
+        let quic_config =
+            QuicServerConfig::try_from(tls_config).context("invalid QUIC TLS config")?;
+        let server_config = ServerConfig::with_crypto(Arc::new(quic_config));
 
         let endpoint = match source {
             SocketSource::Bind(addr) => {
@@ -74,9 +76,7 @@ impl Relay {
                     Ok(conn) => {
                         let sni = conn
                             .handshake_data()
-                            .and_then(|d| {
-                                d.downcast::<quinn::crypto::rustls::HandshakeData>().ok()
-                            })
+                            .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
                             .and_then(|hd| hd.server_name.clone());
 
                         info!(sni = ?sni, remote = %conn.remote_address(), "client tunnel connected");
@@ -96,6 +96,9 @@ mod tests {
 
     #[tokio::test]
     async fn relay_binds_to_loopback() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok(); // ok() because another test in the same process may have already installed it
         let relay = Relay::bind("127.0.0.1:0").await;
         assert!(relay.is_ok(), "relay should bind to a random port");
     }

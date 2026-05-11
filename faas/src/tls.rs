@@ -1,15 +1,18 @@
 use anyhow::{Context, Result};
+use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::ServerConfig;
-use rcgen::{CertifiedKey, generate_simple_self_signed};
 
-pub fn self_signed_cert() -> Result<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>)> {
+pub fn self_signed_cert() -> Result<(
+    rustls::pki_types::CertificateDer<'static>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
     let CertifiedKey { cert, key_pair } =
         generate_simple_self_signed(vec!["wormhole-relay".to_string()])
             .context("failed to generate self-signed cert")?;
 
     let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
     let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
-        .context("invalid private key")?;
+        .map_err(|e| anyhow::anyhow!("invalid private key: {e}"))?;
 
     Ok((cert_der, key_der))
 }
