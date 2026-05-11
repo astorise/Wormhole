@@ -6,6 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
 use crate::router::Router;
+use crate::tachyon_net;
 
 const PEEK_BUF: usize = 1024;
 
@@ -17,9 +18,9 @@ pub struct Ingress {
 impl Ingress {
     pub async fn new(bind_addr: &str, router: Arc<Router>) -> Result<Self> {
         let addr: SocketAddr = bind_addr.parse().context("invalid ingress bind address")?;
-        let listener = TcpListener::bind(addr)
+        let listener = tachyon_net::bind_tcp(addr)
             .await
-            .context("failed to bind ingress TCP")?;
+            .context("failed to bind TCP ingress")?;
         info!(addr = %addr, "TCP ingress listening");
         Ok(Self { listener, router })
     }
@@ -51,10 +52,6 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, router: Arc<Router>) ->
     });
 
     info!(peer = %peer, sni = %sni, "routing ingress connection");
-
-    // Pass the buffered bytes and the remaining stream separately.
-    // The router will write the initial bytes to the QUIC send stream first,
-    // then bridge the rest bidirectionally without consuming or decrypting anything.
     router.route_ingress(&sni, &buf, stream).await;
     Ok(())
 }

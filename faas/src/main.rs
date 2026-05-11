@@ -21,12 +21,15 @@ async fn main() -> Result<()> {
     let tcp_ingress = Ingress::new("0.0.0.0:443", Arc::clone(&router)).await?;
 
     // UDP ingress: QUIC DCID-based routing for HTTP/3 traffic.
+    // The same socket is shared with the relay egress loop so all UDP replies
+    // originate from port 443 (NAT-safe).
     let udp_ingress = UdpIngress::bind("0.0.0.0:443", Arc::clone(&router)).await?;
+    let public_socket = udp_ingress.socket();
 
     tokio::select! {
-        res = relay.run()       => res?,
-        res = tcp_ingress.run() => res?,
-        res = udp_ingress.run() => res?,
+        res = relay.run(public_socket)  => res?,
+        res = tcp_ingress.run()         => res?,
+        res = udp_ingress.run()         => res?,
     }
 
     Ok(())

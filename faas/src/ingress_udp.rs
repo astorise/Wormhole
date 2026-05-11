@@ -5,6 +5,7 @@ use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
 use crate::router::Router;
+use crate::tachyon_net;
 
 const MAX_DATAGRAM: usize = 1500;
 
@@ -14,10 +15,11 @@ pub struct UdpIngress {
 }
 
 impl UdpIngress {
-    /// Bind a UDP socket and return the ingress handler.
+    /// Bind a UDP socket via `tachyon_net` (OS socket on native, pre-opened FD
+    /// on `wasm32-wasi`) and return the ingress handler.
     pub async fn bind(bind_addr: &str, router: Arc<Router>) -> Result<Self> {
         let addr: SocketAddr = bind_addr.parse().context("invalid UDP ingress address")?;
-        let socket = UdpSocket::bind(addr)
+        let socket = tachyon_net::bind_udp(addr)
             .await
             .context("failed to bind UDP ingress socket")?;
         info!(addr = %addr, "UDP ingress listening");
@@ -27,7 +29,7 @@ impl UdpIngress {
         })
     }
 
-    /// Expose the underlying socket so main.rs can pass it to the egress path.
+    /// Expose the underlying socket so `relay.run()` can reuse it for egress.
     pub fn socket(&self) -> Arc<UdpSocket> {
         Arc::clone(&self.socket)
     }
@@ -63,15 +65,8 @@ impl UdpIngress {
 /// Extract the QUIC Destination Connection ID from the first bytes of a raw
 /// UDP datagram containing a QUIC packet.
 ///
-/// QUIC Long Header (Initial/Handshake/0-RTT):
-///   byte 0: 1xxx_xxxx  (high bit set)
-///   bytes 1-4: Version
-///   byte 5: DCID length
-///   bytes 6..(6+dcid_len): DCID
-///
-/// QUIC Short Header (1-RTT, post-handshake):
-///   byte 0: 0xxx_xxxx  (high bit clear)
-///   bytes 1..9: DCID (fixed 8-byte length assumed — standard server-chosen CID)
+/// QUIC Long Header: byte 0 high-bit set; DCID length at byte 5; DCID at 6..
+/// QUIC Short Header: byte 0 high-bit clear; 8-byte DCID assumed at bytes 1..9.
 pub fn peek_quic_dcid(buf: &[u8]) -> Option<String> {
     if buf.is_empty() {
         return None;

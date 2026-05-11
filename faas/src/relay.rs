@@ -47,7 +47,7 @@ impl Relay {
                 ep
             }
             SocketSource::Tachyon(_sock) => {
-                unimplemented!("Tachyon Virtual Socket Layer not yet wired")
+                unimplemented!("Tachyon Virtual Socket Layer not yet wired for QUIC endpoint")
             }
         };
 
@@ -66,15 +66,16 @@ impl Relay {
         Arc::clone(&self.router)
     }
 
-    /// Run the QUIC control-plane: accepts outbound tunnels from local clients.
+    /// Run the QUIC control-plane.
     ///
-    /// For each connected client, two concurrent tasks are spawned:
-    ///   1. `conn.closed()` watcher — calls `unregister()` on drop.
-    ///   2. Datagram egress loop — reads datagrams from the client tunnel and
-    ///      forwards them to the remote caller via the shared public UDP socket.
-    pub async fn run(self) -> Result<()> {
+    /// `public_socket` is the **shared** UDP socket already bound by `UdpIngress`
+    /// (e.g. on port 443).  All datagram egress replies use this socket so they
+    /// originate from the same public port that callers sent to, keeping NAT
+    /// mappings alive.
+    pub async fn run(self, public_socket: Arc<UdpSocket>) -> Result<()> {
         while let Some(incoming) = self.endpoint.accept().await {
             let router = Arc::clone(&self.router);
+            let socket = Arc::clone(&public_socket);
             tokio::spawn(async move {
                 match incoming.await {
                     Ok(conn) => {
@@ -88,10 +89,9 @@ impl Relay {
                         info!(key = %key, remote = %conn.remote_address(), "client tunnel connected");
                         router.register(conn.clone(), sni).await;
 
-                        // Lifecycle + egress run concurrently for this connection.
                         tokio::join!(
                             Self::watch_closed(conn.clone(), key.clone(), Arc::clone(&router)),
-                            Self::egress_loop(conn, key, Arc::clone(&router)),
+                            Self::egress_loop(conn, key, router, socket),
                         );
                     }
                     Err(e) => warn!(err = %e, "connection failed"),
@@ -101,39 +101,31 @@ impl Relay {
         Ok(())
     }
 
-    /// Await the connection closing and clean up routing state.
     async fn watch_closed(conn: quinn::Connection, key: String, router: Arc<Router>) {
         let reason = conn.closed().await;
         info!(key = %key, reason = ?reason, "client tunnel closed");
         router.unregister(&key);
     }
 
-    /// Read datagrams arriving from the client tunnel and send them back to the
-    /// remote caller via the public UDP socket stored in the router's return-path
-    /// table.
-    ///
-    /// The public UDP socket is shared via the router; we create a temporary
-    /// one here for the egress path. In production this would be the same socket
-    /// as the UDP ingress, passed via the router or a shared Arc.
-    async fn egress_loop(conn: quinn::Connection, key: String, router: Arc<Router>) {
-        // Bind an ephemeral socket for the egress path.  In a real deployment
-        // this would be the shared public UdpSocket from UdpIngress passed
-        // through the Router, but wiring that through would require a larger
-        // refactor outside the scope of this change.
-        let egress_socket = match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                warn!(key = %key, err = %e, "failed to bind egress UDP socket");
-                return;
-            }
-        };
-
+    /// Read datagrams from the client tunnel and forward them to the remote caller
+    /// using the shared public UDP socket (same port as ingress — NAT-safe).
+    async fn egress_loop(
+        conn: quinn::Connection,
+        key: String,
+        router: Arc<Router>,
+        public_socket: Arc<UdpSocket>,
+    ) {
         while let Ok(data) = conn.read_datagram().await {
             if let Some(caller_addr) = router.udp_return_addr(&key) {
-                if let Err(e) = egress_socket.send_to(&data, caller_addr).await {
+                if let Err(e) = public_socket.send_to(&data, caller_addr).await {
                     warn!(key = %key, err = %e, "failed to send egress UDP datagram");
                 } else {
-                    debug!(key = %key, caller = %caller_addr, bytes = data.len(), "UDP egress datagram sent");
+                    debug!(
+                        key = %key,
+                        caller = %caller_addr,
+                        bytes = data.len(),
+                        "UDP egress datagram sent"
+                    );
                 }
             }
         }
