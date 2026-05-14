@@ -86,7 +86,13 @@ impl Router {
 
     /// Route an ingress TCP stream into the matching client QUIC tunnel.
     /// Bytes transferred are counted in both directions for telemetry.
-    pub async fn route_ingress(&self, sni: &str, initial: &[u8], stream: TcpStream) {
+    pub async fn route_ingress(
+        &self,
+        sni: &str,
+        ingress_port: u16,
+        initial: &[u8],
+        stream: TcpStream,
+    ) {
         let Some(client_conn) = self.table.get(sni).map(|e| e.clone()) else {
             warn!(sni = %sni, "no tunnel registered for SNI — dropping connection");
             self.total_rejected_datagrams
@@ -102,12 +108,20 @@ impl Router {
             }
         };
 
+        let port_header = ingress_port.to_be_bytes();
+        if let Err(e) = quic_send.write_all(&port_header).await {
+            warn!(sni = %sni, err = %e, "failed to write ingress port header to QUIC stream");
+            return;
+        }
+
         if let Err(e) = quic_send.write_all(initial).await {
             warn!(sni = %sni, err = %e, "failed to write initial bytes to QUIC stream");
             return;
         }
-        self.total_ingress_bytes
-            .fetch_add(initial.len() as u64, Ordering::Relaxed);
+        self.total_ingress_bytes.fetch_add(
+            (port_header.len() + initial.len()) as u64,
+            Ordering::Relaxed,
+        );
 
         debug!(sni = %sni, "bridging ingress TCP stream to client tunnel");
 
@@ -133,6 +147,7 @@ impl Router {
     pub async fn route_udp_ingress(
         &self,
         dcid: &str,
+        ingress_port: u16,
         datagram: &[u8],
         caller_addr: SocketAddr,
         _public_socket: Arc<UdpSocket>,
@@ -153,12 +168,17 @@ impl Router {
 
         self.udp_callers.insert(tunnel_key.clone(), caller_addr);
 
-        match client_conn.send_datagram(Bytes::copy_from_slice(datagram)) {
+        let mut framed = Vec::with_capacity(2 + datagram.len());
+        framed.extend_from_slice(&ingress_port.to_be_bytes());
+        framed.extend_from_slice(datagram);
+
+        match client_conn.send_datagram(Bytes::from(framed)) {
             Ok(()) => {
                 self.total_ingress_bytes
-                    .fetch_add(datagram.len() as u64, Ordering::Relaxed);
+                    .fetch_add((2 + datagram.len()) as u64, Ordering::Relaxed);
                 debug!(
                     dcid = %dcid,
+                    ingress_port,
                     caller = %caller_addr,
                     bytes = datagram.len(),
                     "UDP datagram forwarded to client"

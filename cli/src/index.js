@@ -5,7 +5,8 @@ import { discoverCerts, generateEphemeralCert } from './certs.js';
 /**
  * @typedef {Object} TunnelTarget
  * @property {'tcp'|'udp'} protocol
- * @property {number} port  Local port to expose
+ * @property {number} publicPort  Public ingress port to expose
+ * @property {number} localPort  Local port to forward to
  */
 
 /**
@@ -80,10 +81,12 @@ export class Wormhole {
     });
 
     for (const target of targets) {
+      const publicPort = target.publicPort ?? target.port;
+      const localPort = target.localPort ?? target.port;
       if (target.protocol === 'tcp') {
-        await mux.bindTcp(target.port);
+        await mux.bindTcp(publicPort, localPort);
       } else if (target.protocol === 'udp') {
-        await mux.bindUdp(target.port);
+        await mux.bindUdp(publicPort, localPort);
       }
     }
 

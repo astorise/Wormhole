@@ -17,6 +17,7 @@ const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct Ingress {
     listener: TcpListener,
     router: Arc<Router>,
+    ingress_port: u16,
 }
 
 impl Ingress {
@@ -25,16 +26,25 @@ impl Ingress {
         let listener = tachyon_net::bind_tcp(addr)
             .await
             .context("failed to bind TCP ingress")?;
+        let ingress_port = listener
+            .local_addr()
+            .context("failed to read TCP ingress local address")?
+            .port();
         info!(addr = %addr, "TCP ingress listening");
-        Ok(Self { listener, router })
+        Ok(Self {
+            listener,
+            router,
+            ingress_port,
+        })
     }
 
     pub async fn run(self) -> Result<()> {
         loop {
             let (stream, peer) = self.listener.accept().await?;
             let router = Arc::clone(&self.router);
+            let ingress_port = self.ingress_port;
             tokio::spawn(async move {
-                if let Err(e) = handle(stream, peer, router).await {
+                if let Err(e) = handle(stream, peer, router, ingress_port).await {
                     warn!(peer = %peer, err = %e, "ingress error");
                 }
             });
@@ -42,7 +52,12 @@ impl Ingress {
     }
 }
 
-async fn handle(mut stream: TcpStream, peer: SocketAddr, router: Arc<Router>) -> Result<()> {
+async fn handle(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    router: Arc<Router>,
+    ingress_port: u16,
+) -> Result<()> {
     let buf = read_client_hello_prefix(&mut stream)
         .await
         .context("failed to read ClientHello")?;
@@ -53,7 +68,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, router: Arc<Router>) ->
     });
 
     info!(peer = %peer, sni = %sni, "routing ingress connection");
-    router.route_ingress(&sni, &buf, stream).await;
+    router.route_ingress(&sni, ingress_port, &buf, stream).await;
     Ok(())
 }
 

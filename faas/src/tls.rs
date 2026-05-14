@@ -112,6 +112,6 @@ pub fn server_config(
         .with_single_cert(vec![cert], key)
         .context("TLS server cert error")?;
 
-    config.alpn_protocols = vec![b"wormhole/1".to_vec(), b"h3".to_vec()];
+    config.alpn_protocols = vec![b"wormhole/2".to_vec(), b"h3".to_vec()];
     Ok(config)
 }

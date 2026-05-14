@@ -10,7 +10,7 @@ capabilities:
       - udp
 
 alpn:
-  - wormhole/1
+  - wormhole/2
   - h3
 
 routing:

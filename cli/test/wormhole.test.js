@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import * as net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { QuicDialer, loadTlsConfig } from '../src/quic.js';
@@ -14,6 +15,7 @@ import { Multiplexer } from '../src/mux.js';
 /** Minimal fake dialer that supports the Multiplexer's resilience protocol. */
 class FakeDialer extends EventEmitter {
   #connected;
+  #incomingHandlers = new Set();
   constructor(connected = true) {
     super();
     this.#connected = connected;
@@ -24,6 +26,13 @@ class FakeDialer extends EventEmitter {
     return Promise.reject(new Error('no relay in test'));
   }
   sendDatagram() { return Promise.resolve(); }
+  onIncomingStream(handler) {
+    this.#incomingHandlers.add(handler);
+    return () => this.#incomingHandlers.delete(handler);
+  }
+  emitIncomingStream(stream) {
+    for (const handler of this.#incomingHandlers) handler(stream);
+  }
   simulateDisconnect() {
     this.#connected = false;
     this.emit('reconnecting', { attempt: 1, delayMs: 500 });
@@ -31,6 +40,22 @@ class FakeDialer extends EventEmitter {
   simulateReconnect() {
     this.#connected = true;
     this.emit('reconnected');
+  }
+}
+
+class FakeStream extends EventEmitter {
+  writes = [];
+  closed = false;
+
+  write(data) {
+    this.writes.push(Buffer.from(data));
+    this.emit('written');
+    return Promise.resolve();
+  }
+
+  close() {
+    this.closed = true;
+    return Promise.resolve();
   }
 }
 
@@ -144,6 +169,34 @@ describe('Multiplexer', () => {
 
     assert.equal(sent.length, 2, 'queued frames flushed on reconnect');
     mux.closeAll();
+  });
+
+  it('routes incoming framed TCP streams to the mapped local port', async () => {
+    const dialer = new FakeDialer();
+    const mux = new Multiplexer(dialer);
+    const server = net.createServer((socket) => {
+      socket.on('data', (data) => socket.write(data.toString().toUpperCase()));
+    });
+
+    await new Promise((resolve, reject) => {
+      server.listen(0, '127.0.0.1', resolve);
+      server.once('error', reject);
+    });
+
+    const localPort = server.address().port;
+    await mux.bindTcp(443, localPort);
+
+    const stream = new FakeStream();
+    dialer.emitIncomingStream(stream);
+    const header = Buffer.alloc(2);
+    header.writeUInt16BE(443, 0);
+    stream.emit('data', Buffer.concat([header, Buffer.from('ping')]));
+
+    await new Promise((resolve) => stream.once('written', resolve));
+    assert.equal(Buffer.concat(stream.writes).toString(), 'PING');
+
+    mux.closeAll();
+    await new Promise((resolve) => server.close(resolve));
   });
 });
 

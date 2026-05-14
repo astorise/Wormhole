@@ -12,6 +12,7 @@ const MAX_DATAGRAM: usize = 1500;
 pub struct UdpIngress {
     socket: Arc<UdpSocket>,
     router: Arc<Router>,
+    ingress_port: u16,
 }
 
 impl UdpIngress {
@@ -22,10 +23,15 @@ impl UdpIngress {
         let socket = tachyon_net::bind_udp(addr)
             .await
             .context("failed to bind UDP ingress socket")?;
+        let ingress_port = socket
+            .local_addr()
+            .context("failed to read UDP ingress local address")?
+            .port();
         info!(addr = %addr, "UDP ingress listening");
         Ok(Self {
             socket: Arc::new(socket),
             router,
+            ingress_port,
         })
     }
 
@@ -57,7 +63,13 @@ impl UdpIngress {
 
             let forwarded = self
                 .router
-                .route_udp_ingress(&dcid, datagram, caller_addr, Arc::clone(&self.socket))
+                .route_udp_ingress(
+                    &dcid,
+                    self.ingress_port,
+                    datagram,
+                    caller_addr,
+                    Arc::clone(&self.socket),
+                )
                 .await;
             if !forwarded {
                 debug!(dcid = %dcid, "UDP datagram dropped (backpressure)");

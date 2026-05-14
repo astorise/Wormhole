@@ -20,6 +20,8 @@ export class QuicDialer extends EventEmitter {
   #relayUrl;
   #tlsConfig;
   #stopped = false;
+  #incomingStreamHandlers = new Set();
+  #incomingStreamPump = null;
 
   constructor({ relayHost, relayPort, tlsConfig }) {
     super();
@@ -48,6 +50,7 @@ export class QuicDialer extends EventEmitter {
 
     this.#transport = new Http3WebTransport(this.#relayUrl, opts);
     await this.#transport.ready;
+    this.#startIncomingStreamPump();
     this.emit('connected');
   }
 
@@ -94,6 +97,7 @@ export class QuicDialer extends EventEmitter {
 
       if (this.#stopped) return;
       this.#transport = null;
+      this.#incomingStreamPump = null;
 
       // If the relay sent a graceful GoAway (reason "node_shutting_down"),
       // do not attempt to reconnect — emit 'server_closed' so the caller
@@ -130,10 +134,41 @@ export class QuicDialer extends EventEmitter {
     return this.#transport?.datagrams.readable;
   }
 
+  onIncomingStream(handler) {
+    this.#incomingStreamHandlers.add(handler);
+    this.#startIncomingStreamPump();
+    return () => this.#incomingStreamHandlers.delete(handler);
+  }
+
+  #startIncomingStreamPump() {
+    if (this.#incomingStreamPump || !this.#transport?.incomingBidirectionalStreams) return;
+
+    const transport = this.#transport;
+    this.#incomingStreamPump = (async () => {
+      const reader = transport.incomingBidirectionalStreams.getReader();
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          const stream = new QuicStream(value.readable, value.writable);
+          for (const handler of this.#incomingStreamHandlers) {
+            handler(stream);
+          }
+        }
+      } finally {
+        reader.releaseLock?.();
+        if (this.#transport === transport) this.#incomingStreamPump = null;
+      }
+    })();
+
+    this.#incomingStreamPump.catch(() => {});
+  }
+
   close() {
     this.#stopped = true;
     this.#transport?.close();
     this.#transport = null;
+    this.#incomingStreamPump = null;
     this.emit('closed');
   }
 
