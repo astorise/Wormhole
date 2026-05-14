@@ -4,12 +4,10 @@ import { EventEmitter } from 'node:events';
 
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_MAX_MS = 30_000;
-const KEEPALIVE_INTERVAL_MS = 15_000;
-const PING = Buffer.from([0x01]); // 1-byte keep-alive payload
 
 /**
  * QUIC dialer backed by @fails-components/webtransport (libquiche).
- * Supports exponential-backoff auto-reconnect and a periodic keep-alive ping.
+ * Supports exponential-backoff auto-reconnect.
  *
  * Events:
  *   connected     — session established (initial or after reconnect)
@@ -22,7 +20,6 @@ export class QuicDialer extends EventEmitter {
   #relayUrl;
   #tlsConfig;
   #stopped = false;
-  #keepAliveTimer = null;
 
   constructor({ relayHost, relayPort, tlsConfig }) {
     super();
@@ -39,6 +36,7 @@ export class QuicDialer extends EventEmitter {
     const { Http3WebTransport } = await import('@fails-components/webtransport');
 
     const opts = {
+      rejectUnauthorized: this.#tlsConfig.rejectUnauthorized,
       serverCertificateHashes: this.#tlsConfig.serverCertHashes ?? [],
     };
     if (this.#tlsConfig.cert && this.#tlsConfig.key) {
@@ -50,7 +48,6 @@ export class QuicDialer extends EventEmitter {
 
     this.#transport = new Http3WebTransport(this.#relayUrl, opts);
     await this.#transport.ready;
-    this.#startKeepalive();
     this.emit('connected');
   }
 
@@ -96,7 +93,6 @@ export class QuicDialer extends EventEmitter {
       }
 
       if (this.#stopped) return;
-      this.#stopKeepalive();
       this.#transport = null;
 
       // If the relay sent a graceful GoAway (reason "node_shutting_down"),
@@ -134,26 +130,8 @@ export class QuicDialer extends EventEmitter {
     return this.#transport?.datagrams.readable;
   }
 
-  /** Send a periodic 1-byte ping to keep NAT and gateway affinity alive. */
-  #startKeepalive() {
-    this.#stopKeepalive();
-    this.#keepAliveTimer = setInterval(async () => {
-      if (!this.#transport) return;
-      try { await this.sendDatagram(PING); } catch { /* ignore; drop handled by watchForDrops */ }
-    }, KEEPALIVE_INTERVAL_MS);
-    this.#keepAliveTimer.unref?.(); // don't prevent process exit
-  }
-
-  #stopKeepalive() {
-    if (this.#keepAliveTimer) {
-      clearInterval(this.#keepAliveTimer);
-      this.#keepAliveTimer = null;
-    }
-  }
-
   close() {
     this.#stopped = true;
-    this.#stopKeepalive();
     this.#transport?.close();
     this.#transport = null;
     this.emit('closed');
@@ -199,13 +177,14 @@ export class QuicStream extends EventEmitter {
  * Build the TLS configuration object for the QUIC dialer.
  *
  * @param {{ cert: string, key: string } | undefined} auth - Client cert/key paths for mTLS.
- * @param {string | undefined} caPath - Path to the relay's CA certificate (.pem).
+ * @param {string | undefined} caPath - Path to the relay's CA certificate chain (.pem).
  *   When provided, its SHA-256 fingerprint is added to `serverCertificateHashes`
  *   so the WebTransport client pins that trust anchor and rejects any relay cert
  *   not signed by it (prevents MITM).
+ * @param {{ unsecure?: boolean }} [options] - Explicitly disable strict relay verification.
  */
-export function loadTlsConfig(auth, caPath) {
-  const config = { rejectUnauthorized: !!auth };
+export function loadTlsConfig(auth, caPath, options = {}) {
+  const config = { rejectUnauthorized: options.unsecure !== true };
 
   if (auth) {
     // auth.raw === true when the cert/key are PEM strings (auto-generated or
@@ -215,24 +194,29 @@ export function loadTlsConfig(auth, caPath) {
   }
 
   if (caPath) {
-    const caDer = parsePemToDer(readFileSync(caPath));
-    const hash = createHash('sha-256').update(caDer).digest();
-    config.serverCertHashes = [{ algorithm: 'sha-256', value: hash }];
+    config.serverCertHashes = parsePemCertificatesToDer(readFileSync(caPath)).map((caDer) => ({
+      algorithm: 'sha-256',
+      value: createHash('sha-256').update(caDer).digest(),
+    }));
   }
 
   return config;
 }
 
 /**
- * Strip PEM armour and return the raw DER bytes of the first certificate.
+ * Strip PEM armour and return the raw DER bytes for every certificate block.
  * @param {Buffer} pem
- * @returns {Buffer}
+ * @returns {Buffer[]}
  */
-function parsePemToDer(pem) {
-  const b64 = pem
-    .toString('ascii')
-    .split('\n')
-    .filter((l) => !l.startsWith('-----'))
-    .join('');
-  return Buffer.from(b64, 'base64');
+function parsePemCertificatesToDer(pem) {
+  const text = pem.toString('ascii');
+  const certs = [];
+  const pattern = /-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/g;
+
+  for (const match of text.matchAll(pattern)) {
+    const b64 = match[1].replace(/\s+/g, '');
+    if (b64.length > 0) certs.push(Buffer.from(b64, 'base64'));
+  }
+
+  return certs.length > 0 ? certs : [Buffer.from(pem)];
 }

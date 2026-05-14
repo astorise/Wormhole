@@ -15,6 +15,7 @@ import { discoverCerts, generateEphemeralCert } from './certs.js';
  * @property {string} [sni]             SNI hostname (defaults to relay host)
  * @property {{ cert: string, key: string }} [auth]  mTLS cert/key file paths
  * @property {string} [ca]              Path to relay CA certificate (.pem)
+ * @property {boolean} [unsecure]       Disable relay certificate verification
  */
 
 export class Wormhole {
@@ -46,7 +47,7 @@ export class Wormhole {
    * @returns {Promise<Wormhole>}
    */
   static async create(opts) {
-    const { relay, targets = [], sni, auth: explicitAuth, ca } = opts;
+    const { relay, targets = [], sni, auth: explicitAuth, ca, unsecure } = opts;
 
     const [relayHost, relayPortStr] = relay.split(':');
     const relayPort = parseInt(relayPortStr ?? '4433', 10);
@@ -65,10 +66,10 @@ export class Wormhole {
       }
     }
 
-    const tlsConfig = loadTlsConfig(auth, ca);
+    const tlsConfig = loadTlsConfig(auth, ca, { unsecure });
     const dialer = new QuicDialer({ relayHost, relayPort, tlsConfig });
 
-    await dialer.connect();
+    await dialer.connectWithRetry();
 
     const mux = new Multiplexer(dialer);
 

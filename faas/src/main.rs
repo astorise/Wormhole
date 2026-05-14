@@ -16,19 +16,18 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    // Priority: mTLS > explicit unsecure > silent dev mode (no warning).
+    // Priority: mTLS > explicit local development mode.
     let relay = if let Ok(path) = std::env::var("WORMHOLE_CA_CERT") {
         let pem =
             std::fs::read(&path).with_context(|| format!("failed to read CA cert from {path}"))?;
         let ca_cert = load_ca_cert_from_pem(&pem)?;
         Relay::bind_with_mtls("0.0.0.0:4433", ca_cert).await?
-    } else if std::env::var("WORMHOLE_UNSECURE")
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
-    {
+    } else if env_flag("WORMHOLE_DEV") {
         Relay::bind_unsecure("0.0.0.0:4433").await?
     } else {
-        Relay::bind("0.0.0.0:4433").await?
+        panic!(
+            "WORMHOLE_CA_CERT is required for mTLS; set WORMHOLE_DEV=1 only for local unsecure development"
+        );
     };
 
     // Grab a cloned endpoint handle *before* consuming `relay` in `run()`.
@@ -90,4 +89,10 @@ fn load_ca_cert_from_pem(pem: &[u8]) -> Result<rustls::pki_types::CertificateDer
         .into_iter()
         .next()
         .context("CA PEM contained no certificates")
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
 }

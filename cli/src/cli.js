@@ -14,6 +14,7 @@ program
   .option('--cert <path>', 'Path to client certificate (.pem)')
   .option('--key <path>', 'Path to client private key (.pem)')
   .option('--ca <path>', 'Path to relay CA certificate (.pem) — pins relay trust anchor, prevents MITM')
+  .option('--unsecure', 'Disable relay certificate verification; only for local development')
   .option('--sni <name>', 'SNI hostname to advertise to the relay')
   .action(async (opts) => {
     const targets = [];
@@ -31,6 +32,7 @@ program
       sni: opts.sni,
       auth: opts.cert && opts.key ? { cert: opts.cert, key: opts.key } : undefined,
       ca: opts.ca,
+      unsecure: opts.unsecure,
     });
 
     console.log(`Wormhole open: ${tunnel.endpoint}`);

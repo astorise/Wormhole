@@ -163,7 +163,21 @@ impl Relay {
                         };
 
                         info!(key = %key, remote = %conn.remote_address(), "client tunnel connected");
-                        router.register(conn.clone(), Some(key.clone())).await;
+                        if let Err(e) =
+                            router.register(conn.clone(), Some(key.clone()), allow_insecure)
+                        {
+                            warn!(
+                                key = %key,
+                                remote = %conn.remote_address(),
+                                err = %e,
+                                "rejecting duplicate unauthenticated tunnel"
+                            );
+                            conn.close(
+                                quinn::VarInt::from_u32(1),
+                                b"duplicate tunnel key in unsecure mode",
+                            );
+                            return;
+                        }
 
                         tokio::join!(
                             Self::watch_closed(conn.clone(), key.clone(), Arc::clone(&router)),

@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
 use quinn::Connection;
@@ -10,6 +11,7 @@ use tracing::{debug, info, warn};
 /// Maps SNI / DCID / stable-ID → active client QUIC tunnel.
 pub struct Router {
     table: DashMap<String, Connection>,
+    inverse_table: DashMap<String, String>,
     /// UDP return-path: tunnel key → last seen remote-caller SocketAddr.
     udp_callers: DashMap<String, SocketAddr>,
 
@@ -29,6 +31,7 @@ impl Router {
     pub fn new() -> Self {
         Self {
             table: DashMap::new(),
+            inverse_table: DashMap::new(),
             udp_callers: DashMap::new(),
             total_ingress_bytes: AtomicU64::new(0),
             total_egress_bytes: AtomicU64::new(0),
@@ -37,15 +40,30 @@ impl Router {
     }
 
     /// Register a new client tunnel keyed by SNI or stable connection ID.
-    pub async fn register(&self, conn: Connection, sni: Option<String>) {
+    pub fn register(
+        &self,
+        conn: Connection,
+        sni: Option<String>,
+        reject_duplicate_sni: bool,
+    ) -> Result<String> {
         let key = sni.unwrap_or_else(|| conn.stable_id().to_string());
+        if reject_duplicate_sni && self.table.contains_key(&key) {
+            bail!("tunnel key is already registered");
+        }
+
+        if let Some(old_conn) = self.table.insert(key.clone(), conn.clone()) {
+            self.inverse_table.remove(&old_conn.stable_id().to_string());
+        }
+        self.inverse_table
+            .insert(conn.stable_id().to_string(), key.clone());
         info!(key = %key, "tunnel registered");
-        self.table.insert(key, conn);
+        Ok(key)
     }
 
     /// Remove a dead tunnel and emit structured metrics for the Tachyon log aggregator.
     pub fn unregister(&self, key: &str) {
-        if self.table.remove(key).is_some() {
+        if let Some((_key, conn)) = self.table.remove(key) {
+            self.inverse_table.remove(&conn.stable_id().to_string());
             let ingress = self.total_ingress_bytes.load(Ordering::Relaxed);
             let egress = self.total_egress_bytes.load(Ordering::Relaxed);
             let rejected = self.total_rejected_datagrams.load(Ordering::Relaxed);
@@ -119,24 +137,18 @@ impl Router {
         caller_addr: SocketAddr,
         _public_socket: Arc<UdpSocket>,
     ) -> bool {
-        let client_conn = self
-            .table
-            .get(dcid)
-            .map(|e| e.clone())
-            .or_else(|| self.table.iter().next().map(|e| e.clone()));
-
-        let Some(client_conn) = client_conn else {
+        let Some(client_conn) = self.table.get(dcid).map(|e| e.clone()) else {
             warn!(dcid = %dcid, "no tunnel for DCID — dropping UDP datagram");
             self.total_rejected_datagrams
                 .fetch_add(1, Ordering::Relaxed);
             return false;
         };
 
+        let stable_id = client_conn.stable_id().to_string();
         let tunnel_key = self
-            .table
-            .iter()
-            .find(|e| e.value().stable_id() == client_conn.stable_id())
-            .map(|e| e.key().clone())
+            .inverse_table
+            .get(&stable_id)
+            .map(|e| e.value().clone())
             .unwrap_or_else(|| dcid.to_string());
 
         self.udp_callers.insert(tunnel_key.clone(), caller_addr);

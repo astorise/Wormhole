@@ -1,6 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { QuicDialer, loadTlsConfig } from '../src/quic.js';
 import { Multiplexer } from '../src/mux.js';
 
@@ -36,9 +39,37 @@ class FakeDialer extends EventEmitter {
 // ---------------------------------------------------------------------------
 
 describe('loadTlsConfig', () => {
-  it('returns insecure config when no auth provided', () => {
+  it('uses strict relay verification by default', () => {
     const cfg = loadTlsConfig(undefined);
+    assert.equal(cfg.rejectUnauthorized, true);
+  });
+
+  it('returns insecure config only when explicitly requested', () => {
+    const cfg = loadTlsConfig(undefined, undefined, { unsecure: true });
     assert.equal(cfg.rejectUnauthorized, false);
+  });
+
+  it('pins every certificate in a CA bundle', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wormhole-ca-'));
+    const caPath = join(dir, 'chain.pem');
+    const pem = [
+      '-----BEGIN CERTIFICATE-----',
+      Buffer.from('cert-one').toString('base64'),
+      '-----END CERTIFICATE-----',
+      '-----BEGIN CERTIFICATE-----',
+      Buffer.from('cert-two').toString('base64'),
+      '-----END CERTIFICATE-----',
+    ].join('\n');
+
+    try {
+      writeFileSync(caPath, pem);
+      const cfg = loadTlsConfig(undefined, caPath);
+      assert.equal(cfg.serverCertHashes.length, 2);
+      assert.equal(cfg.serverCertHashes[0].algorithm, 'sha-256');
+      assert.ok(Buffer.isBuffer(cfg.serverCertHashes[0].value));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
