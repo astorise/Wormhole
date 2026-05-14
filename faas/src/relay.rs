@@ -170,7 +170,7 @@ impl Relay {
                                 key = %key,
                                 remote = %conn.remote_address(),
                                 err = %e,
-                                "rejecting duplicate unauthenticated tunnel"
+                                "rejecting duplicate tunnel key"
                             );
                             conn.close(
                                 quinn::VarInt::from_u32(1),
@@ -204,12 +204,23 @@ impl Relay {
         public_socket: Arc<UdpSocket>,
     ) {
         while let Ok(data) = conn.read_datagram().await {
-            if let Some(caller_addr) = router.udp_return_addr(&key) {
-                match public_socket.send_to(&data, caller_addr).await {
+            if data.len() < 4 {
+                warn!(key = %key, "dropping short UDP egress datagram");
+                continue;
+            }
+
+            let public_port = u16::from_be_bytes([data[0], data[1]]);
+            let session_id = u16::from_be_bytes([data[2], data[3]]);
+            let payload = &data[4..];
+
+            if let Some(caller_addr) = router.udp_return_addr(&key, public_port, session_id) {
+                match public_socket.send_to(payload, caller_addr).await {
                     Ok(n) => {
                         router.record_egress_bytes(n as u64);
                         debug!(
                             key = %key,
+                            public_port,
+                            session_id,
                             caller = %caller_addr,
                             bytes = n,
                             "UDP egress datagram sent"

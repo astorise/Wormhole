@@ -8,17 +8,17 @@ const LOOPBACK = '127.0.0.1';
 /**
  * Demultiplexes framed relay traffic to local TCP/UDP ports.
  *
- * Protocol v2 frames inbound relay traffic with a 2-byte big-endian public
- * port header. The multiplexer strips that header, resolves the local target,
- * and forwards only the original payload to the local application.
+ * Protocol v3 uses a 2-byte public port header for TCP streams and a 4-byte
+ * header for UDP datagrams: public port plus relay-assigned session id.
  */
 export class Multiplexer extends EventEmitter {
   #dialer;
   #tcpRoutes = new Map();
   #udpRoutes = new Map();
-  #udpSockets = new Set();
+  #udpSessions = new Map();
   #tcpSockets = new Set();
   #udpQueue = [];
+  #udpDropped = 0;
   #datagramReader = null;
   #unsubscribeIncomingStreams = null;
 
@@ -59,28 +59,14 @@ export class Multiplexer extends EventEmitter {
     return Promise.resolve();
   }
 
-  async bindUdp(publicPort, localPort = publicPort) {
-    const socket = dgram.createSocket('udp4');
-    this.#udpRoutes.set(publicPort, { localPort, socket });
-    this.#udpSockets.add(socket);
-
-    socket.on('message', async (msg) => {
-      if (!this.#dialer.connected) {
-        if (this.#udpQueue.length >= UDP_QUEUE_MAX) this.#udpQueue.shift();
-        this.#udpQueue.push(msg);
-        return;
-      }
-
-      await this.#dialer.sendDatagram(msg).catch(() => {});
-    });
-
-    await new Promise((resolve, reject) => {
-      socket.bind(0, LOOPBACK, resolve);
-      socket.once('error', reject);
-    });
-
+  bindUdp(publicPort, localPort = publicPort) {
+    this.#udpRoutes.set(publicPort, localPort);
     this.emit('bound', { protocol: 'udp', publicPort, localPort });
-    return socket;
+    return Promise.resolve();
+  }
+
+  get udpDropped() {
+    return this.#udpDropped;
   }
 
   #handleIncomingStream(stream) {
@@ -144,7 +130,7 @@ export class Multiplexer extends EventEmitter {
         for (;;) {
           const { value, done } = await reader.read();
           if (done) break;
-          this.#handleIncomingDatagram(Buffer.from(value));
+          this.#handleIncomingDatagram(Buffer.from(value)).catch(() => {});
         }
       } finally {
         reader.releaseLock?.();
@@ -156,21 +142,66 @@ export class Multiplexer extends EventEmitter {
     this.#datagramReader.catch(() => {});
   }
 
-  #handleIncomingDatagram(data) {
-    if (data.length < 2) return;
+  async #handleIncomingDatagram(data) {
+    if (data.length < 4) return;
 
     const publicPort = data.readUInt16BE(0);
-    const route = this.#udpRoutes.get(publicPort);
-    if (!route) return;
+    const sessionId = data.readUInt16BE(2);
+    const localPort = this.#udpRoutes.get(publicPort);
+    if (!localPort) return;
 
-    const payload = data.subarray(2);
-    route.socket.send(payload, route.localPort, LOOPBACK);
+    const session = await this.#udpSession(publicPort, sessionId);
+    session.socket.send(data.subarray(4), localPort, LOOPBACK);
+  }
+
+  async #udpSession(publicPort, sessionId) {
+    const key = `${publicPort}:${sessionId}`;
+    const existing = this.#udpSessions.get(key);
+    if (existing) return existing;
+
+    const socket = dgram.createSocket('udp4');
+    const session = { publicPort, sessionId, socket };
+    this.#udpSessions.set(key, session);
+
+    socket.on('message', (msg) => {
+      const frame = Buffer.alloc(4 + msg.length);
+      frame.writeUInt16BE(publicPort, 0);
+      frame.writeUInt16BE(sessionId, 2);
+      msg.copy(frame, 4);
+      this.#sendOrQueueDatagram(frame);
+    });
+    socket.once('close', () => this.#udpSessions.delete(key));
+
+    await new Promise((resolve, reject) => {
+      socket.bind(0, LOOPBACK, resolve);
+      socket.once('error', reject);
+    });
+
+    return session;
+  }
+
+  #sendOrQueueDatagram(frame) {
+    if (!this.#dialer.connected) {
+      if (this.#udpQueue.length >= UDP_QUEUE_MAX) this.#dropOldestUdp();
+      this.#udpQueue.push(frame);
+      return;
+    }
+
+    this.#dialer.sendDatagram(frame).catch(() => {});
   }
 
   /** Test helper: enqueue a raw UDP payload as if received while disconnected. */
   _testEnqueueUdp(frame) {
-    if (this.#udpQueue.length >= UDP_QUEUE_MAX) this.#udpQueue.shift();
+    if (this.#udpQueue.length >= UDP_QUEUE_MAX) this.#dropOldestUdp();
     this.#udpQueue.push(frame);
+  }
+
+  #dropOldestUdp() {
+    this.#udpQueue.shift();
+    this.#udpDropped += 1;
+    const detail = { udpDropped: this.#udpDropped };
+    this.emit('warn', detail);
+    console.warn('[wormhole] UDP queue full; dropping oldest datagram', detail);
   }
 
   drain() {
@@ -202,13 +233,13 @@ export class Multiplexer extends EventEmitter {
     for (const sock of this.#tcpSockets) {
       try { sock.destroy(); } catch {}
     }
-    for (const socket of this.#udpSockets) {
+    for (const { socket } of this.#udpSessions.values()) {
       try { socket.close(); } catch {}
     }
 
     this.#tcpRoutes.clear();
     this.#udpRoutes.clear();
-    this.#udpSockets.clear();
+    this.#udpSessions.clear();
     this.#tcpSockets.clear();
     this.#udpQueue.length = 0;
   }

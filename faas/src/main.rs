@@ -16,6 +16,9 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    let relay_cert_dir = wormhole_relay::tls::relay_cert_dir();
+    info!(path = %relay_cert_dir.display(), "relay certificate persistence directory");
+
     // Priority: mTLS > explicit local development mode.
     let relay = if let Ok(path) = std::env::var("WORMHOLE_CA_CERT") {
         let pem =
@@ -25,7 +28,7 @@ async fn main() -> Result<()> {
     } else if env_flag("WORMHOLE_DEV") {
         Relay::bind_unsecure("0.0.0.0:4433").await?
     } else {
-        panic!(
+        anyhow::bail!(
             "WORMHOLE_CA_CERT is required for mTLS; set WORMHOLE_DEV=1 only for local unsecure development"
         );
     };

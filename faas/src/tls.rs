@@ -1,18 +1,27 @@
 use anyhow::{Context, Result};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::ServerConfig;
+use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-const RELAY_CERT_PATH: &str = "/tmp/wormhole-relay-cert.der";
-const RELAY_KEY_PATH: &str = "/tmp/wormhole-relay-key.der";
+const DEFAULT_RELAY_CERT_DIR: &str = "/tmp";
+const RELAY_CERT_FILE: &str = "wormhole-relay-cert.der";
+const RELAY_KEY_FILE: &str = "wormhole-relay-key.der";
+
+pub fn relay_cert_dir() -> PathBuf {
+    env::var_os("WORMHOLE_RELAY_CERT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_RELAY_CERT_DIR))
+}
 
 pub fn self_signed_cert() -> Result<(
     rustls::pki_types::CertificateDer<'static>,
     rustls::pki_types::PrivateKeyDer<'static>,
 )> {
-    if let Some(cert) = load_persisted_self_signed_cert()? {
+    let cert_dir = relay_cert_dir();
+    if let Some(cert) = load_persisted_self_signed_cert(&cert_dir)? {
         return Ok(cert);
     }
 
@@ -22,7 +31,7 @@ pub fn self_signed_cert() -> Result<(
 
     let cert_bytes = cert.der().to_vec();
     let key_bytes = key_pair.serialize_der();
-    persist_self_signed_cert(&cert_bytes, &key_bytes)?;
+    persist_self_signed_cert(&cert_dir, &cert_bytes, &key_bytes)?;
 
     let cert_der = rustls::pki_types::CertificateDer::from(cert_bytes);
     let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_bytes)
@@ -31,23 +40,25 @@ pub fn self_signed_cert() -> Result<(
     Ok((cert_der, key_der))
 }
 
-fn load_persisted_self_signed_cert() -> Result<
+fn load_persisted_self_signed_cert(
+    cert_dir: &PathBuf,
+) -> Result<
     Option<(
         rustls::pki_types::CertificateDer<'static>,
         rustls::pki_types::PrivateKeyDer<'static>,
     )>,
 > {
-    let cert_path = Path::new(RELAY_CERT_PATH);
-    let key_path = Path::new(RELAY_KEY_PATH);
+    let cert_path = cert_dir.join(RELAY_CERT_FILE);
+    let key_path = cert_dir.join(RELAY_KEY_FILE);
 
     if !cert_path.exists() || !key_path.exists() {
         return Ok(None);
     }
 
-    let cert_bytes = fs::read(cert_path)
-        .with_context(|| format!("failed to read relay cert from {RELAY_CERT_PATH}"))?;
-    let key_bytes = fs::read(key_path)
-        .with_context(|| format!("failed to read relay key from {RELAY_KEY_PATH}"))?;
+    let cert_bytes = fs::read(&cert_path)
+        .with_context(|| format!("failed to read relay cert from {}", cert_path.display()))?;
+    let key_bytes = fs::read(&key_path)
+        .with_context(|| format!("failed to read relay key from {}", key_path.display()))?;
 
     let cert_der = rustls::pki_types::CertificateDer::from(cert_bytes);
     let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_bytes)
@@ -56,27 +67,37 @@ fn load_persisted_self_signed_cert() -> Result<
     Ok(Some((cert_der, key_der)))
 }
 
-fn persist_self_signed_cert(cert_der: &[u8], key_der: &[u8]) -> Result<()> {
-    if let Some(parent) = Path::new(RELAY_CERT_PATH).parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create relay cert directory {parent:?}"))?;
-    }
-    if let Some(parent) = Path::new(RELAY_KEY_PATH).parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create relay key directory {parent:?}"))?;
-    }
+fn persist_self_signed_cert(cert_dir: &PathBuf, cert_der: &[u8], key_der: &[u8]) -> Result<()> {
+    fs::create_dir_all(cert_dir).with_context(|| {
+        format!(
+            "failed to create relay cert directory {}",
+            cert_dir.display()
+        )
+    })?;
 
-    fs::write(RELAY_CERT_PATH, cert_der)
-        .with_context(|| format!("failed to persist relay cert to {RELAY_CERT_PATH}"))?;
-    fs::write(RELAY_KEY_PATH, key_der)
-        .with_context(|| format!("failed to persist relay key to {RELAY_KEY_PATH}"))?;
+    let cert_path = cert_dir.join(RELAY_CERT_FILE);
+    let key_path = cert_dir.join(RELAY_KEY_FILE);
+
+    fs::write(&cert_path, cert_der)
+        .with_context(|| format!("failed to persist relay cert to {}", cert_path.display()))?;
+    fs::write(&key_path, key_der)
+        .with_context(|| format!("failed to persist relay key to {}", key_path.display()))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(RELAY_KEY_PATH, fs::Permissions::from_mode(0o600)).with_context(
-            || format!("failed to restrict relay key permissions at {RELAY_KEY_PATH}"),
-        )?;
+        fs::set_permissions(&cert_path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "failed to restrict relay cert permissions at {}",
+                cert_path.display()
+            )
+        })?;
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "failed to restrict relay key permissions at {}",
+                key_path.display()
+            )
+        })?;
     }
 
     Ok(())
@@ -112,6 +133,6 @@ pub fn server_config(
         .with_single_cert(vec![cert], key)
         .context("TLS server cert error")?;
 
-    config.alpn_protocols = vec![b"wormhole/2".to_vec(), b"h3".to_vec()];
+    config.alpn_protocols = vec![b"wormhole/3".to_vec(), b"h3".to_vec()];
     Ok(config)
 }

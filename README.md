@@ -1,54 +1,67 @@
-# 🕳️ Wormhole
+# Wormhole
 
-**Wormhole** is a universal, high-performance transport-layer tunnel designed to bypass NATs and firewalls. By utilizing **QUIC** as its underlying transport, it creates a secure bi-directional conduit for both **TCP** and **UDP** traffic with minimal overhead and end-to-end mTLS encryption.
+Wormhole is a QUIC-based L4 tunnel for exposing local TCP and UDP services through an edge relay. The relay owns the public ingress port. The CLI keeps an outbound mTLS tunnel open and routes relay-pushed traffic to local loopback services.
 
-Part of the **Tachyon-Mesh** ecosystem, Wormhole provides the "secure pipe" necessary to expose local development environments, HTTP/3 services, or any custom network stack to remote clients (LLMs, edge workers, or Pulsar nodes).
+## Protocol Model
 
-## ✨ Key Features
+- The relay listens on public TCP and UDP ports.
+- The CLI connects outbound to the relay over QUIC using the `wormhole/3` ALPN.
+- TCP ingress is pushed from relay to CLI as a bidirectional QUIC stream with a 2-byte public-port header.
+- UDP ingress is pushed as QUIC datagrams with a 4-byte header: public port plus relay session id.
+- UDP replies from the local service reuse the same 4-byte header so the relay can return packets to the exact remote caller.
+- In production, relay tunnel identity comes from the verified client certificate SAN.
 
-- **L4 Agnostic**: Transparently tunnels TCP (SSH, HTTP/1.1, WebDAV) and UDP (HTTP/3, QUIC, DNS).
-- **QUIC Powered**: Leverage multiplexing and 0-RTT handshakes to eliminate "TCP Meltdown" and reduce latency.
-- **Pure JS Client**: A lightweight CLI and library for Node.js, perfect for VS Code extensions and automation.
-- **Rust/Wasm Relay**: High-throughput edge routing using Tachyon FaaS components.
-- **True E2E mTLS**: Security is terminated at the local client. The relay acts as a stateless bit-shifter, ensuring total privacy.
+## Usage
 
-## 🏗️ Project Structure
-
-- **/cli**: The Node.js client. Initiates the outbound QUIC tunnel and bridges local ports.
-- **/faas**: Rust-based logic for Tachyon-Mesh nodes, handling SNI-based routing for incoming flows.
-- **/manifest**: OpenSpec definitions and protocol orchestration metadata.
-
-## 🚀 Usage
-
-### Standalone CLI
-Expose a local WebDAV server (TCP) and a dev HTTP/3 service (UDP):
+Expose local TCP port `8443` on public port `443`, and local UDP port `4433` on public port `443`:
 
 ```bash
-npx @tachyon-mesh/wormhole --relay https://relay.tachyon.io --tcp 8443 --udp 4433
+npx @tachyon-mesh/wormhole --relay relay.tachyon.io:4433 --tcp 443:8443 --udp 443:4433 --ca relay-ca.pem --cert client.pem --key client.key
 ```
 
-### As a Dependency
-Integrate secure tunneling directly into your Node.js application:
+For local development only, the relay can run without mTLS:
+
+```bash
+WORMHOLE_DEV=1 wormhole-relay
+npx @tachyon-mesh/wormhole --relay 127.0.0.1:4433 --tcp 8443 --udp 4433 --unsecure
+```
+
+A single port value maps public and local ports to the same number. For example, `--tcp 8080` is equivalent to `--tcp 8080:8080`.
+
+## Library
 
 ```javascript
 import { Wormhole } from '@tachyon-mesh/wormhole';
 
 const tunnel = await Wormhole.create({
-    relay: 'relay.tachyon.io',
-    targets: [
-        { protocol: 'tcp', port: 8443 },
-        { protocol: 'udp', port: 4433 }
-    ],
-    auth: { cert: './client.crt', key: './client.key' }
+  relay: 'relay.tachyon.io:4433',
+  targets: [
+    { protocol: 'tcp', publicPort: 443, localPort: 8443 },
+    { protocol: 'udp', publicPort: 443, localPort: 4433 },
+  ],
+  ca: './relay-ca.pem',
+  auth: { cert: './client.pem', key: './client.key' },
 });
 
 console.log(`Wormhole open: ${tunnel.endpoint}`);
 ```
 
-## 🛠️ Build & CI
-The project uses GitHub Actions for:
-- **Wasm Compilation**: Optimizing Rust FaaS for Tachyon edge nodes.
-- **Zero-Dependency Bundle**: Minifying the CLI for instant execution.
+## Repository
 
----
-*Forging the backbone of the decentralized mesh.*
+- `cli`: Node.js CLI and library that maintains the outbound QUIC tunnel and demultiplexes relay-pushed traffic.
+- `faas`: Rust relay for Tachyon edge workers.
+- `manifest`: protocol and deployment metadata.
+- `openspec`: change proposals, tasks, and archived implementation records.
+
+## Relay Configuration
+
+- `WORMHOLE_CA_CERT`: path to the CA certificate used to verify client mTLS certificates.
+- `WORMHOLE_DEV=1`: local development mode without client authentication.
+- `WORMHOLE_RELAY_CERT_DIR`: directory for persisted relay development certificate and key. Defaults to `/tmp`.
+
+## Development
+
+```bash
+cd faas && cargo test
+cd ../cli && npm test
+```

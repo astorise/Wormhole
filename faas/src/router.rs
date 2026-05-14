@@ -2,6 +2,8 @@ use anyhow::{bail, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
 use quinn::Connection;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,8 +14,9 @@ use tracing::{debug, info, warn};
 pub struct Router {
     table: DashMap<String, Connection>,
     inverse_table: DashMap<String, String>,
+    dcid_to_sni: DashMap<String, String>,
     /// UDP return-path: tunnel key → last seen remote-caller SocketAddr.
-    udp_callers: DashMap<String, SocketAddr>,
+    udp_callers: DashMap<(String, u16, u16), SocketAddr>,
 
     // ── Telemetry counters (updated atomically, logged on tunnel close) ──────
     pub total_ingress_bytes: AtomicU64,
@@ -32,6 +35,7 @@ impl Router {
         Self {
             table: DashMap::new(),
             inverse_table: DashMap::new(),
+            dcid_to_sni: DashMap::new(),
             udp_callers: DashMap::new(),
             total_ingress_bytes: AtomicU64::new(0),
             total_egress_bytes: AtomicU64::new(0),
@@ -44,16 +48,14 @@ impl Router {
         &self,
         conn: Connection,
         sni: Option<String>,
-        reject_duplicate_sni: bool,
+        _reject_duplicate_sni: bool,
     ) -> Result<String> {
         let key = sni.unwrap_or_else(|| conn.stable_id().to_string());
-        if reject_duplicate_sni && self.table.contains_key(&key) {
+        if self.table.contains_key(&key) {
             bail!("tunnel key is already registered");
         }
 
-        if let Some(old_conn) = self.table.insert(key.clone(), conn.clone()) {
-            self.inverse_table.remove(&old_conn.stable_id().to_string());
-        }
+        self.table.insert(key.clone(), conn.clone());
         self.inverse_table
             .insert(conn.stable_id().to_string(), key.clone());
         info!(key = %key, "tunnel registered");
@@ -64,6 +66,7 @@ impl Router {
     pub fn unregister(&self, key: &str) {
         if let Some((_key, conn)) = self.table.remove(key) {
             self.inverse_table.remove(&conn.stable_id().to_string());
+            self.dcid_to_sni.retain(|_, sni| sni != key);
             let ingress = self.total_ingress_bytes.load(Ordering::Relaxed);
             let egress = self.total_egress_bytes.load(Ordering::Relaxed);
             let rejected = self.total_rejected_datagrams.load(Ordering::Relaxed);
@@ -77,7 +80,12 @@ impl Router {
                 "tunnel unregistered"
             );
         }
-        self.udp_callers.remove(key);
+        self.udp_callers
+            .retain(|(tunnel_key, _, _), _| tunnel_key != key);
+    }
+
+    pub fn map_dcid_to_sni(&self, dcid: &str, sni: String) {
+        self.dcid_to_sni.insert(dcid.to_string(), sni);
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -152,33 +160,37 @@ impl Router {
         caller_addr: SocketAddr,
         _public_socket: Arc<UdpSocket>,
     ) -> bool {
-        let Some(client_conn) = self.table.get(dcid).map(|e| e.clone()) else {
+        let Some(tunnel_key) = self.dcid_to_sni.get(dcid).map(|e| e.value().clone()) else {
             warn!(dcid = %dcid, "no tunnel for DCID — dropping UDP datagram");
             self.total_rejected_datagrams
                 .fetch_add(1, Ordering::Relaxed);
             return false;
         };
 
-        let stable_id = client_conn.stable_id().to_string();
-        let tunnel_key = self
-            .inverse_table
-            .get(&stable_id)
-            .map(|e| e.value().clone())
-            .unwrap_or_else(|| dcid.to_string());
+        let Some(client_conn) = self.table.get(&tunnel_key).map(|e| e.clone()) else {
+            warn!(dcid = %dcid, tunnel_key = %tunnel_key, "mapped UDP tunnel is not registered");
+            self.total_rejected_datagrams
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
 
-        self.udp_callers.insert(tunnel_key.clone(), caller_addr);
+        let session_id = udp_session_id(ingress_port, caller_addr);
+        self.udp_callers
+            .insert((tunnel_key.clone(), ingress_port, session_id), caller_addr);
 
-        let mut framed = Vec::with_capacity(2 + datagram.len());
+        let mut framed = Vec::with_capacity(4 + datagram.len());
         framed.extend_from_slice(&ingress_port.to_be_bytes());
+        framed.extend_from_slice(&session_id.to_be_bytes());
         framed.extend_from_slice(datagram);
 
         match client_conn.send_datagram(Bytes::from(framed)) {
             Ok(()) => {
                 self.total_ingress_bytes
-                    .fetch_add((2 + datagram.len()) as u64, Ordering::Relaxed);
+                    .fetch_add((4 + datagram.len()) as u64, Ordering::Relaxed);
                 debug!(
                     dcid = %dcid,
                     ingress_port,
+                    session_id,
                     caller = %caller_addr,
                     bytes = datagram.len(),
                     "UDP datagram forwarded to client"
@@ -202,13 +214,27 @@ impl Router {
     }
 
     /// Look up the UDP return address for a given tunnel key.
-    pub fn udp_return_addr(&self, tunnel_key: &str) -> Option<SocketAddr> {
-        self.udp_callers.get(tunnel_key).map(|e| *e)
+    pub fn udp_return_addr(
+        &self,
+        tunnel_key: &str,
+        public_port: u16,
+        session_id: u16,
+    ) -> Option<SocketAddr> {
+        self.udp_callers
+            .get(&(tunnel_key.to_string(), public_port, session_id))
+            .map(|e| *e)
     }
 
     pub fn active_tunnels(&self) -> usize {
         self.table.len()
     }
+}
+
+fn udp_session_id(public_port: u16, caller_addr: SocketAddr) -> u16 {
+    let mut hasher = DefaultHasher::new();
+    public_port.hash(&mut hasher);
+    caller_addr.hash(&mut hasher);
+    hasher.finish() as u16
 }
 
 #[cfg(test)]

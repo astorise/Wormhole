@@ -1,6 +1,6 @@
 [package]
 name = "wormhole-relay"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Wormhole FaaS relay — stateless QUIC router for Tachyon-Mesh"
 license = "MIT"
@@ -26,6 +26,10 @@ rcgen = "0.13"
 tls-parser = "0.12"
 x509-parser = "0.15"
 rustls-pemfile = "2"
+aes = "0.8"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio-test = "0.4"

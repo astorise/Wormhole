@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import * as net from 'node:net';
+import * as dgram from 'node:dgram';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { QuicDialer, loadTlsConfig } from '../src/quic.js';
@@ -16,9 +17,16 @@ import { Multiplexer } from '../src/mux.js';
 class FakeDialer extends EventEmitter {
   #connected;
   #incomingHandlers = new Set();
+  #datagramController;
+
   constructor(connected = true) {
     super();
     this.#connected = connected;
+    this.datagramReader = new ReadableStream({
+      start: (controller) => {
+        this.#datagramController = controller;
+      },
+    });
   }
   get connected() { return this.#connected; }
   openStream() {
@@ -32,6 +40,9 @@ class FakeDialer extends EventEmitter {
   }
   emitIncomingStream(stream) {
     for (const handler of this.#incomingHandlers) handler(stream);
+  }
+  pushDatagram(data) {
+    this.#datagramController.enqueue(data);
   }
   simulateDisconnect() {
     this.#connected = false;
@@ -95,6 +106,28 @@ describe('loadTlsConfig', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('rejects invalid CA PEM input', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wormhole-ca-'));
+    const caPath = join(dir, 'invalid.pem');
+
+    try {
+      writeFileSync(caPath, 'not a certificate');
+      assert.throws(
+        () => loadTlsConfig(undefined, caPath),
+        /Invalid CA certificate provided/,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects invalid raw client PEM input', () => {
+    assert.throws(
+      () => loadTlsConfig({ raw: true, cert: 'not a cert', key: 'not a key' }),
+      /Invalid certificate provided/,
+    );
   });
 });
 
@@ -171,6 +204,25 @@ describe('Multiplexer', () => {
     mux.closeAll();
   });
 
+  it('counts dropped UDP datagrams when the reconnect queue overflows', () => {
+    const dialer = new FakeDialer(false);
+    const mux = new Multiplexer(dialer);
+    mux.on('warn', () => {});
+    const originalWarn = console.warn;
+    console.warn = () => {};
+
+    try {
+      for (let i = 0; i < 257; i++) {
+        mux._testEnqueueUdp(Buffer.from([i & 0xff]));
+      }
+
+      assert.equal(mux.udpDropped, 1);
+    } finally {
+      console.warn = originalWarn;
+      mux.closeAll();
+    }
+  });
+
   it('routes incoming framed TCP streams to the mapped local port', async () => {
     const dialer = new FakeDialer();
     const mux = new Multiplexer(dialer);
@@ -197,6 +249,45 @@ describe('Multiplexer', () => {
 
     mux.closeAll();
     await new Promise((resolve) => server.close(resolve));
+  });
+
+  it('routes UDP datagrams by public port and session id', async () => {
+    const sent = [];
+    const dialer = new FakeDialer();
+    dialer.sendDatagram = async (frame) => { sent.push(Buffer.from(frame)); };
+
+    const mux = new Multiplexer(dialer);
+    const local = dgram.createSocket('udp4');
+    local.on('message', (msg, rinfo) => {
+      assert.equal(msg.toString(), 'ping');
+      local.send(Buffer.from('pong'), rinfo.port, rinfo.address);
+    });
+
+    await new Promise((resolve, reject) => {
+      local.bind(0, '127.0.0.1', resolve);
+      local.once('error', reject);
+    });
+
+    const localPort = local.address().port;
+    await mux.bindUdp(443, localPort);
+
+    const frame = Buffer.alloc(8);
+    frame.writeUInt16BE(443, 0);
+    frame.writeUInt16BE(7, 2);
+    Buffer.from('ping').copy(frame, 4);
+    dialer.pushDatagram(frame);
+
+    await new Promise((resolve) => {
+      const check = () => sent.length > 0 ? resolve() : setTimeout(check, 5);
+      check();
+    });
+
+    assert.equal(sent[0].readUInt16BE(0), 443);
+    assert.equal(sent[0].readUInt16BE(2), 7);
+    assert.equal(sent[0].subarray(4).toString(), 'pong');
+
+    mux.closeAll();
+    await new Promise((resolve) => local.close(resolve));
   });
 });
 

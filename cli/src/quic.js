@@ -4,6 +4,8 @@ import { EventEmitter } from 'node:events';
 
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_MAX_MS = 30_000;
+const CERT_PEM_PATTERN = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/;
+const KEY_PEM_PATTERN = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z ]*PRIVATE KEY-----/;
 
 /**
  * QUIC dialer backed by @fails-components/webtransport (libquiche).
@@ -224,8 +226,18 @@ export function loadTlsConfig(auth, caPath, options = {}) {
   if (auth) {
     // auth.raw === true when the cert/key are PEM strings (auto-generated or
     // discovered from ~/.ssh/). Otherwise they are file paths to read.
-    config.cert = auth.raw ? Buffer.from(auth.cert) : readFileSync(auth.cert);
-    config.key = auth.raw ? Buffer.from(auth.key) : readFileSync(auth.key);
+    config.cert = readPemInput(
+      auth.cert,
+      auth.raw,
+      CERT_PEM_PATTERN,
+      'Invalid certificate provided. Must be a valid PEM file path or string.',
+    );
+    config.key = readPemInput(
+      auth.key,
+      auth.raw,
+      KEY_PEM_PATTERN,
+      'Invalid private key provided. Must be a valid PEM file path or string.',
+    );
   }
 
   if (caPath) {
@@ -253,5 +265,24 @@ function parsePemCertificatesToDer(pem) {
     if (b64.length > 0) certs.push(Buffer.from(b64, 'base64'));
   }
 
-  return certs.length > 0 ? certs : [Buffer.from(pem)];
+  if (certs.length === 0) {
+    throw new Error('Invalid CA certificate provided. Must be a valid PEM file path.');
+  }
+
+  return certs;
+}
+
+function readPemInput(value, raw, pattern, message) {
+  let pem;
+  try {
+    pem = raw ? Buffer.from(value) : readFileSync(value);
+  } catch {
+    throw new Error(message);
+  }
+
+  if (!pattern.test(pem.toString('ascii'))) {
+    throw new Error(message);
+  }
+
+  return pem;
 }
