@@ -47,6 +47,13 @@ jobs:
         # Run clippy on the native target, not wasm
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Audit dependencies
+        uses: actions-rust-lang/audit@v1
+        with:
+          workingDirectory: faas
+          file: Cargo.lock
+          createIssues: false
+
       - name: Run tests
         run: cargo test --verbose
 

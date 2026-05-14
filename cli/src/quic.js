@@ -90,7 +90,7 @@ export class QuicDialer extends EventEmitter {
       const transport = this.#transport;
       if (!transport) return;
 
-      let closeReason = null;
+      let closeReason;
       try {
         closeReason = await transport.closed;
       } catch (err) {

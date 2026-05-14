@@ -231,10 +231,10 @@ export class Multiplexer extends EventEmitter {
     this.#unsubscribeIncomingStreams = null;
 
     for (const sock of this.#tcpSockets) {
-      try { sock.destroy(); } catch {}
+      try { sock.destroy(); } catch { /* Best effort cleanup. */ }
     }
     for (const { socket } of this.#udpSessions.values()) {
-      try { socket.close(); } catch {}
+      try { socket.close(); } catch { /* Best effort cleanup. */ }
     }
 
     this.#tcpRoutes.clear();

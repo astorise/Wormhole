@@ -3,7 +3,7 @@ use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::ServerConfig;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const DEFAULT_RELAY_CERT_DIR: &str = "/tmp";
@@ -41,7 +41,7 @@ pub fn self_signed_cert() -> Result<(
 }
 
 fn load_persisted_self_signed_cert(
-    cert_dir: &PathBuf,
+    cert_dir: &Path,
 ) -> Result<
     Option<(
         rustls::pki_types::CertificateDer<'static>,
@@ -67,7 +67,7 @@ fn load_persisted_self_signed_cert(
     Ok(Some((cert_der, key_der)))
 }
 
-fn persist_self_signed_cert(cert_dir: &PathBuf, cert_der: &[u8], key_der: &[u8]) -> Result<()> {
+fn persist_self_signed_cert(cert_dir: &Path, cert_der: &[u8], key_der: &[u8]) -> Result<()> {
     fs::create_dir_all(cert_dir).with_context(|| {
         format!(
             "failed to create relay cert directory {}",
