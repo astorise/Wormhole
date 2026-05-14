@@ -163,9 +163,7 @@ impl Relay {
                         };
 
                         info!(key = %key, remote = %conn.remote_address(), "client tunnel connected");
-                        if let Err(e) =
-                            router.register(conn.clone(), Some(key.clone()), allow_insecure)
-                        {
+                        if let Err(e) = router.register(conn.clone(), Some(key.clone()), mtls) {
                             warn!(
                                 key = %key,
                                 remote = %conn.remote_address(),
@@ -192,9 +190,10 @@ impl Relay {
     }
 
     async fn watch_closed(conn: quinn::Connection, key: String, router: Arc<Router>) {
+        let stable_id = conn.stable_id().to_string();
         let reason = conn.closed().await;
         info!(key = %key, reason = ?reason, "client tunnel closed");
-        router.unregister(&key);
+        router.unregister_connection(&key, &stable_id);
     }
 
     async fn egress_loop(

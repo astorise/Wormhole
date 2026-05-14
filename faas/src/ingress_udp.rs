@@ -271,7 +271,10 @@ fn first_crypto_frame(mut payload: &[u8]) -> Option<Vec<u8>> {
                 payload = skip_ack_frame(payload)?;
             }
             0x06 => {
-                let (_offset, consumed) = read_varint(payload)?;
+                let (offset, consumed) = read_varint(payload)?;
+                if offset > 0 {
+                    return None;
+                }
                 payload = &payload[consumed..];
                 let (len, consumed) = read_varint(payload)?;
                 payload = &payload[consumed..];
@@ -355,6 +358,94 @@ mod tests {
         p
     }
 
+    fn encode_varint(value: u64) -> Vec<u8> {
+        if value < 64 {
+            vec![value as u8]
+        } else if value < 16_384 {
+            ((value as u16) | 0x4000).to_be_bytes().to_vec()
+        } else if value < 1_073_741_824 {
+            ((value as u32) | 0x8000_0000).to_be_bytes().to_vec()
+        } else {
+            (value | 0xC000_0000_0000_0000).to_be_bytes().to_vec()
+        }
+    }
+
+    fn client_hello_with_sni(name: &str) -> Vec<u8> {
+        let name = name.as_bytes();
+        let extension_len = 2 + 1 + 2 + name.len();
+        let extension_block_len = 4 + extension_len;
+        let body_len = 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extension_block_len;
+
+        let mut hello = Vec::with_capacity(4 + body_len);
+        hello.push(0x01);
+        hello.extend_from_slice(&[
+            ((body_len >> 16) & 0xff) as u8,
+            ((body_len >> 8) & 0xff) as u8,
+            (body_len & 0xff) as u8,
+        ]);
+        hello.extend_from_slice(&[0x03, 0x03]);
+        hello.extend_from_slice(&[0x11; 32]);
+        hello.push(0);
+        hello.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        hello.extend_from_slice(&[0x01, 0x00]);
+        hello.extend_from_slice(&(extension_block_len as u16).to_be_bytes());
+        hello.extend_from_slice(&[0x00, 0x00]);
+        hello.extend_from_slice(&(extension_len as u16).to_be_bytes());
+        hello.extend_from_slice(&((extension_len - 2) as u16).to_be_bytes());
+        hello.push(0);
+        hello.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        hello.extend_from_slice(name);
+        hello
+    }
+
+    fn crypto_frame(offset: u64, data: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0x06];
+        frame.extend_from_slice(&encode_varint(offset));
+        frame.extend_from_slice(&encode_varint(data.len() as u64));
+        frame.extend_from_slice(data);
+        frame
+    }
+
+    fn protected_initial_packet(crypto_offset: u64, server_name: &str) -> Vec<u8> {
+        let dcid = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
+        let crypto = crypto_frame(crypto_offset, &client_hello_with_sni(server_name));
+        let secrets = initial_secrets(&dcid).expect("initial secrets");
+        let packet_number = 1u64;
+        let pn_len = 4usize;
+        let length = pn_len + crypto.len() + 16;
+
+        let mut header = vec![0xC0 | ((pn_len - 1) as u8)];
+        header.extend_from_slice(&QUIC_V1.to_be_bytes());
+        header.push(dcid.len() as u8);
+        header.extend_from_slice(&dcid);
+        header.push(0);
+        header.push(0);
+        header.extend_from_slice(&encode_varint(length as u64));
+        let pn_offset = header.len();
+        header.extend_from_slice(&(packet_number as u32).to_be_bytes());
+
+        let nonce = initial_nonce(&secrets.iv, packet_number);
+        let cipher = Aes128Gcm::new_from_slice(&secrets.key).expect("initial cipher");
+        let mut payload = crypto;
+        cipher
+            .encrypt_in_place(Nonce::from_slice(&nonce), &header, &mut payload)
+            .expect("encrypt initial payload");
+
+        let mut packet = header;
+        packet.extend_from_slice(&payload);
+
+        let sample = packet
+            .get(pn_offset + 4..pn_offset + 20)
+            .expect("header protection sample");
+        let mask = aes_mask(&secrets.hp, sample).expect("header protection mask");
+        packet[0] ^= mask[0] & 0x0f;
+        for i in 0..pn_len {
+            packet[pn_offset + i] ^= mask[i + 1];
+        }
+
+        packet
+    }
+
     #[test]
     fn extracts_dcid_from_long_header() {
         let dcid = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
@@ -383,5 +474,43 @@ mod tests {
     fn returns_none_for_zero_dcid_length_in_long_header() {
         let pkt = vec![0xC0, 0, 0, 0, 1, 0, 0xAA];
         assert_eq!(peek_quic_dcid(&pkt), None);
+    }
+
+    #[test]
+    fn reads_quic_varints() {
+        assert_eq!(read_varint(&[0x25]), Some((37, 1)));
+        assert_eq!(read_varint(&[0x40, 0x25]), Some((37, 2)));
+        assert_eq!(read_varint(&[0x80, 0x00, 0x00, 0x25]), Some((37, 4)));
+        assert_eq!(
+            read_varint(&[0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25]),
+            Some((37, 8))
+        );
+    }
+
+    #[test]
+    fn extracts_first_crypto_frame_at_zero_offset() {
+        let hello = client_hello_with_sni("example.com");
+        assert_eq!(first_crypto_frame(&crypto_frame(0, &hello)), Some(hello));
+    }
+
+    #[test]
+    fn rejects_fragmented_crypto_frame_offset() {
+        let hello = client_hello_with_sni("example.com");
+        assert_eq!(first_crypto_frame(&crypto_frame(1, &hello)), None);
+    }
+
+    #[test]
+    fn peeks_sni_from_valid_initial_packet() {
+        let packet = protected_initial_packet(0, "example.com");
+        assert_eq!(
+            peek_quic_initial_sni(&packet),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_fragmented_initial_packet() {
+        let packet = protected_initial_packet(1, "example.com");
+        assert_eq!(peek_quic_initial_sni(&packet), None);
     }
 }

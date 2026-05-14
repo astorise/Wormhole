@@ -1,11 +1,21 @@
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
+#[cfg(not(target_arch = "wasm32"))]
 use anyhow::{Context, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
 use tracing::info;
+#[cfg(not(target_arch = "wasm32"))]
 use tracing_subscriber::EnvFilter;
 
+#[cfg(not(target_arch = "wasm32"))]
 use wormhole_relay::{ingress::Ingress, ingress_udp::UdpIngress, relay::Relay};
 
+#[cfg(not(target_arch = "wasm32"))]
 #[tokio::main]
 async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
@@ -61,6 +71,7 @@ async fn main() -> Result<()> {
 
 /// Resolves on SIGINT (Ctrl-C) on all platforms; also listens for SIGTERM
 /// on Unix so process managers (systemd, Docker) can trigger clean shutdown.
+#[cfg(not(target_arch = "wasm32"))]
 async fn shutdown_signal() {
     let ctrl_c = async { tokio::signal::ctrl_c().await.unwrap_or(()) };
 
@@ -83,6 +94,7 @@ async fn shutdown_signal() {
     ctrl_c.await;
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_ca_cert_from_pem(pem: &[u8]) -> Result<rustls::pki_types::CertificateDer<'static>> {
     let mut cursor = std::io::Cursor::new(pem);
     let certs = rustls_pemfile::certs(&mut cursor)
@@ -94,6 +106,7 @@ fn load_ca_cert_from_pem(pem: &[u8]) -> Result<rustls::pki_types::CertificateDer
         .context("CA PEM contained no certificates")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))

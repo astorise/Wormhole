@@ -3,9 +3,11 @@ import js from '@eslint/js';
 const nodeGlobals = {
   Buffer: 'readonly',
   ReadableStream: 'readonly',
+  clearInterval: 'readonly',
   console: 'readonly',
   process: 'readonly',
   setImmediate: 'readonly',
+  setInterval: 'readonly',
   setTimeout: 'readonly',
 };
 

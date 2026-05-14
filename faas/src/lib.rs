@@ -1,6 +1,12 @@
+#[cfg(not(target_arch = "wasm32"))]
 pub mod ingress;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod ingress_udp;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod relay;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod router;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod tachyon_net;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod tls;

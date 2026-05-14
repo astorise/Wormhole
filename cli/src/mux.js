@@ -3,6 +3,8 @@ import * as dgram from 'node:dgram';
 import { EventEmitter } from 'node:events';
 
 const UDP_QUEUE_MAX = 256;
+const UDP_SESSION_TTL_MS = 5 * 60 * 1000;
+const UDP_SESSION_GC_INTERVAL_MS = 60 * 1000;
 const LOOPBACK = '127.0.0.1';
 
 /**
@@ -21,10 +23,16 @@ export class Multiplexer extends EventEmitter {
   #udpDropped = 0;
   #datagramReader = null;
   #unsubscribeIncomingStreams = null;
+  #udpSessionGc = null;
 
   constructor(dialer) {
     super();
     this.#dialer = dialer;
+    this.#udpSessionGc = setInterval(
+      () => this.#collectIdleUdpSessions(),
+      UDP_SESSION_GC_INTERVAL_MS,
+    );
+    this.#udpSessionGc.unref?.();
 
     this.#unsubscribeIncomingStreams = dialer.onIncomingStream?.((stream) => {
       this.#handleIncomingStream(stream);
@@ -151,19 +159,24 @@ export class Multiplexer extends EventEmitter {
     if (!localPort) return;
 
     const session = await this.#udpSession(publicPort, sessionId);
+    session.lastActivity = Date.now();
     session.socket.send(data.subarray(4), localPort, LOOPBACK);
   }
 
   async #udpSession(publicPort, sessionId) {
     const key = `${publicPort}:${sessionId}`;
     const existing = this.#udpSessions.get(key);
-    if (existing) return existing;
+    if (existing) {
+      existing.lastActivity = Date.now();
+      return existing;
+    }
 
     const socket = dgram.createSocket('udp4');
-    const session = { publicPort, sessionId, socket };
+    const session = { publicPort, sessionId, socket, lastActivity: Date.now() };
     this.#udpSessions.set(key, session);
 
     socket.on('message', (msg) => {
+      session.lastActivity = Date.now();
       const frame = Buffer.alloc(4 + msg.length);
       frame.writeUInt16BE(publicPort, 0);
       frame.writeUInt16BE(sessionId, 2);
@@ -178,6 +191,15 @@ export class Multiplexer extends EventEmitter {
     });
 
     return session;
+  }
+
+  #collectIdleUdpSessions(now = Date.now()) {
+    for (const [key, session] of this.#udpSessions.entries()) {
+      if (now - session.lastActivity <= UDP_SESSION_TTL_MS) continue;
+
+      this.#udpSessions.delete(key);
+      try { session.socket.close(); } catch { /* Best effort cleanup. */ }
+    }
   }
 
   #sendOrQueueDatagram(frame) {
@@ -229,6 +251,10 @@ export class Multiplexer extends EventEmitter {
   closeAll() {
     this.#unsubscribeIncomingStreams?.();
     this.#unsubscribeIncomingStreams = null;
+    if (this.#udpSessionGc) {
+      clearInterval(this.#udpSessionGc);
+      this.#udpSessionGc = null;
+    }
 
     for (const sock of this.#tcpSockets) {
       try { sock.destroy(); } catch { /* Best effort cleanup. */ }

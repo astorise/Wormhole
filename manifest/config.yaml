@@ -1,5 +1,5 @@
 name: wormhole-core
-version: 0.3.0
+version: 0.3.1
 description: Universal L4 transport tunnel over QUIC with end-to-end mTLS
 
 capabilities:
@@ -17,7 +17,8 @@ routing:
   strategy: sni-passthrough
   description: >
     The relay routes incoming connections to the correct QUIC tunnel
-    based on SNI or Connection ID without decrypting the payload.
+    based on SNI or Connection ID. Initial packets are peeked for SNI routing,
+    while application payloads remain E2E encrypted.
   affinity:
     # Gateway Steering: the Tachyon gateway pins each SNI/Connection-ID to the
     # specific worker instance holding the in-memory DashMap routing table.

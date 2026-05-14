@@ -1,6 +1,6 @@
 [package]
 name = "wormhole-relay"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Wormhole FaaS relay — stateless QUIC router for Tachyon-Mesh"
 license = "MIT"
@@ -13,7 +13,7 @@ path = "src/main.rs"
 name = "wormhole_relay"
 path = "src/lib.rs"
 
-[dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 quinn = "0.11"
 rustls = { version = "0.23", features = ["ring"] }
 tokio = { version = "1", features = ["full"] }
