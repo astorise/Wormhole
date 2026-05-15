@@ -8,7 +8,7 @@
     ".": "./src/index.js"
   },
   "bin": {
-    "wormhole": "./src/cli.js"
+    "wormhole": "src/cli.js"
   },
   "scripts": {
     "start": "node src/cli.js",
