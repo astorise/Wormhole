@@ -1,6 +1,6 @@
 [package]
 name = "wormhole-relay"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Wormhole FaaS relay — stateless QUIC router for Tachyon-Mesh"
 license = "MIT"
@@ -32,7 +32,12 @@ hkdf = "0.12"
 sha2 = "0.10"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
 tokio-test = "0.4"
+
+[[bench]]
+name = "router_bench"
+harness = false
 
 [profile.release]
 opt-level = "z"

@@ -151,6 +151,9 @@ pub fn peek_quic_dcid(buf: &[u8]) -> Option<String> {
         }
         Some(hex(&buf[6..6 + dcid_len]))
     } else {
+        // QUIC short headers do not encode the DCID length. Wormhole assumes
+        // an 8-byte DCID here and relies on Tachyon Gateway L4 stickiness to
+        // keep short-header traffic pinned to the worker that saw the Initial.
         if buf.len() < 9 {
             return None;
         }
@@ -407,26 +410,51 @@ mod tests {
     }
 
     fn protected_initial_packet(crypto_offset: u64, server_name: &str) -> Vec<u8> {
+        protected_initial_packet_with_target_len(crypto_offset, server_name, None)
+    }
+
+    fn protected_initial_packet_with_target_len(
+        crypto_offset: u64,
+        server_name: &str,
+        target_len: Option<usize>,
+    ) -> Vec<u8> {
         let dcid = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
         let crypto = crypto_frame(crypto_offset, &client_hello_with_sni(server_name));
         let secrets = initial_secrets(&dcid).expect("initial secrets");
         let packet_number = 1u64;
         let pn_len = 4usize;
-        let length = pn_len + crypto.len() + 16;
+        let mut padding_len = 0usize;
 
-        let mut header = vec![0xC0 | ((pn_len - 1) as u8)];
-        header.extend_from_slice(&QUIC_V1.to_be_bytes());
-        header.push(dcid.len() as u8);
-        header.extend_from_slice(&dcid);
-        header.push(0);
-        header.push(0);
-        header.extend_from_slice(&encode_varint(length as u64));
-        let pn_offset = header.len();
-        header.extend_from_slice(&(packet_number as u32).to_be_bytes());
+        let (header, pn_offset, payload_len) = loop {
+            let payload_len = crypto.len() + padding_len;
+            let length = pn_len + payload_len + 16;
+
+            let mut header = vec![0xC0 | ((pn_len - 1) as u8)];
+            header.extend_from_slice(&QUIC_V1.to_be_bytes());
+            header.push(dcid.len() as u8);
+            header.extend_from_slice(&dcid);
+            header.push(0);
+            header.extend_from_slice(&encode_varint(0));
+            header.extend_from_slice(&encode_varint(length as u64));
+            let pn_offset = header.len();
+            header.extend_from_slice(&(packet_number as u32).to_be_bytes());
+
+            let packet_len = header.len() + payload_len + 16;
+            match target_len {
+                Some(target) if packet_len < target => {
+                    padding_len += target - packet_len;
+                }
+                Some(target) if packet_len > target => {
+                    panic!("target packet length {target} is too small for Initial packet");
+                }
+                _ => break (header, pn_offset, payload_len),
+            }
+        };
 
         let nonce = initial_nonce(&secrets.iv, packet_number);
         let cipher = Aes128Gcm::new_from_slice(&secrets.key).expect("initial cipher");
         let mut payload = crypto;
+        payload.resize(payload_len, 0x00);
         cipher
             .encrypt_in_place(Nonce::from_slice(&nonce), &header, &mut payload)
             .expect("encrypt initial payload");
@@ -477,6 +505,20 @@ mod tests {
     }
 
     #[test]
+    fn extracts_dcid_from_20_byte_long_header() {
+        let dcid = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
+        ];
+        let pkt = long_header_packet(&dcid);
+
+        assert_eq!(
+            peek_quic_dcid(&pkt),
+            Some("000102030405060708090a0b0c0d0e0f10111213".to_string())
+        );
+    }
+
+    #[test]
     fn reads_quic_varints() {
         assert_eq!(read_varint(&[0x25]), Some((37, 1)));
         assert_eq!(read_varint(&[0x40, 0x25]), Some((37, 2)));
@@ -502,6 +544,17 @@ mod tests {
     #[test]
     fn peeks_sni_from_valid_initial_packet() {
         let packet = protected_initial_packet(0, "example.com");
+        assert_eq!(
+            peek_quic_initial_sni(&packet),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn peeks_sni_from_1200_byte_padded_initial_packet() {
+        let packet = protected_initial_packet_with_target_len(0, "example.com", Some(1200));
+
+        assert_eq!(packet.len(), 1200);
         assert_eq!(
             peek_quic_initial_sni(&packet),
             Some("example.com".to_string())
