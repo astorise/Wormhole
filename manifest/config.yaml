@@ -1,5 +1,5 @@
 name: wormhole-core
-version: 0.3.3
+version: 1.0.0
 description: Universal L4 transport tunnel over QUIC with end-to-end mTLS
 
 capabilities:

@@ -31,7 +31,7 @@ function parsePort(value, label) {
 program
   .name('wormhole')
   .description('Universal L4 transport tunnel over QUIC with end-to-end mTLS')
-  .version('0.3.3')
+  .version('1.0.0')
   .requiredOption('--relay <url>', 'Relay server URL (e.g. relay.tachyon.io:4433)')
   .option('--tcp <public:local>', 'TCP port mapping to expose', collectPortMapping, [])
   .option('--udp <public:local>', 'UDP port mapping to expose', collectPortMapping, [])
