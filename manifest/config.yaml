@@ -1,5 +1,5 @@
 name: wormhole-core
-version: 0.3.1
+version: 0.3.2
 description: Universal L4 transport tunnel over QUIC with end-to-end mTLS
 
 capabilities:
@@ -29,7 +29,10 @@ routing:
 components:
   relay:
     language: rust
+    # Current wasm32-wasip1 support is a placeholder for future Tachyon host
+    # bindings. Native QUIC socket runtime is cfg-gated out on wasm32 today.
     target: wasm32-wasip1
+    target_status: placeholder
     package: faas
     entrypoint: faas/src/main.rs
     execution_mode: worker  # long-lived process; tokio keeps QUIC connections alive

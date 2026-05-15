@@ -121,6 +121,15 @@ impl Relay {
     pub async fn run(self, public_socket: Arc<UdpSocket>) -> Result<()> {
         let mtls = self.mtls;
         let allow_insecure = self.allow_insecure;
+        let gc_router = Arc::clone(&self.router);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                gc_router.gc_udp_sessions(Duration::from_secs(10 * 60));
+            }
+        });
+
         while let Some(incoming) = self.endpoint.accept().await {
             let router = Arc::clone(&self.router);
             let socket = Arc::clone(&public_socket);

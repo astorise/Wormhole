@@ -10,6 +10,8 @@ Relay-generated development certificates are persisted under `WORMHOLE_RELAY_CER
 
 ## Reporting Vulnerabilities
 
+Contact: security@tachyon-mesh.dev
+
 Do not open public issues for suspected vulnerabilities. Email the maintainers with:
 
 - affected commit or release

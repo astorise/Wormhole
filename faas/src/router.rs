@@ -6,17 +6,26 @@ use quinn::Connection;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::{debug, info, warn};
 
+const UDP_FALLBACK_WINDOW: Duration = Duration::from_secs(5);
+
+struct Tunnel {
+    conn: Connection,
+    next_udp_session_id: AtomicU16,
+}
+
 /// Maps SNI / DCID / stable-ID → active client QUIC tunnel.
 pub struct Router {
-    table: DashMap<String, Connection>,
+    table: DashMap<String, Arc<Tunnel>>,
     inverse_table: DashMap<String, String>,
-    dcid_to_sni: DashMap<String, String>,
+    dcid_to_sni: DashMap<String, (String, Instant)>,
     /// UDP return-path: tunnel key → last seen remote-caller SocketAddr.
-    udp_callers: DashMap<(String, u16, u16), SocketAddr>,
-    next_udp_session_id: AtomicU16,
+    udp_callers: DashMap<(String, u16, u16), (SocketAddr, Instant)>,
+    caller_to_tunnel: DashMap<SocketAddr, (String, Instant)>,
+    caller_to_session: DashMap<(String, SocketAddr), (u16, Instant)>,
 
     // ── Telemetry counters (updated atomically, logged on tunnel close) ──────
     pub total_ingress_bytes: AtomicU64,
@@ -37,7 +46,8 @@ impl Router {
             inverse_table: DashMap::new(),
             dcid_to_sni: DashMap::new(),
             udp_callers: DashMap::new(),
-            next_udp_session_id: AtomicU16::new(0),
+            caller_to_tunnel: DashMap::new(),
+            caller_to_session: DashMap::new(),
             total_ingress_bytes: AtomicU64::new(0),
             total_egress_bytes: AtomicU64::new(0),
             total_rejected_datagrams: AtomicU64::new(0),
@@ -52,12 +62,18 @@ impl Router {
                 bail!("tunnel key is already registered");
             }
 
-            let previous = previous.clone();
-            self.inverse_table.remove(&previous.stable_id().to_string());
-            previous.close(quinn::VarInt::from_u32(0), b"takeover");
+            let previous = Arc::clone(previous.value());
+            self.inverse_table
+                .remove(&previous.conn.stable_id().to_string());
+            self.remove_udp_state_for_tunnel(&key);
+            previous.conn.close(quinn::VarInt::from_u32(0), b"takeover");
         }
 
-        self.table.insert(key.clone(), conn.clone());
+        let tunnel = Arc::new(Tunnel {
+            conn: conn.clone(),
+            next_udp_session_id: AtomicU16::new(0),
+        });
+        self.table.insert(key.clone(), tunnel);
         self.inverse_table
             .insert(conn.stable_id().to_string(), key.clone());
         info!(key = %key, "tunnel registered");
@@ -76,17 +92,17 @@ impl Router {
 
     fn unregister_inner(&self, key: &str, expected_stable_id: Option<&str>) {
         let should_remove = self.table.get(key).is_some_and(|conn| {
-            expected_stable_id.is_none_or(|stable_id| conn.stable_id().to_string() == stable_id)
+            expected_stable_id
+                .is_none_or(|stable_id| conn.conn.stable_id().to_string() == stable_id)
         });
         if !should_remove {
             return;
         }
 
-        if let Some((_key, conn)) = self.table.remove(key) {
-            self.inverse_table.remove(&conn.stable_id().to_string());
-            self.dcid_to_sni.retain(|_, sni| sni != key);
-            self.udp_callers
-                .retain(|(tunnel_key, _, _), _| tunnel_key != key);
+        if let Some((_key, tunnel)) = self.table.remove(key) {
+            self.inverse_table
+                .remove(&tunnel.conn.stable_id().to_string());
+            self.remove_udp_state_for_tunnel(key);
             let ingress = self.total_ingress_bytes.load(Ordering::Relaxed);
             let egress = self.total_egress_bytes.load(Ordering::Relaxed);
             let rejected = self.total_rejected_datagrams.load(Ordering::Relaxed);
@@ -103,7 +119,8 @@ impl Router {
     }
 
     pub fn map_dcid_to_sni(&self, dcid: &str, sni: String) {
-        self.dcid_to_sni.insert(dcid.to_string(), sni);
+        self.dcid_to_sni
+            .insert(dcid.to_string(), (sni, Instant::now()));
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -119,7 +136,7 @@ impl Router {
         initial: &[u8],
         stream: TcpStream,
     ) {
-        let Some(client_conn) = self.table.get(sni).map(|e| e.clone()) else {
+        let Some(client_conn) = self.table.get(sni).map(|e| e.conn.clone()) else {
             warn!(sni = %sni, "no tunnel registered for SNI — dropping connection");
             self.total_rejected_datagrams
                 .fetch_add(1, Ordering::Relaxed);
@@ -178,9 +195,14 @@ impl Router {
         caller_addr: SocketAddr,
         _public_socket: Arc<UdpSocket>,
     ) -> bool {
-        let tunnel_key = if let Some(tunnel_key) = self.dcid_to_sni.get(dcid) {
-            tunnel_key.value().clone()
-        } else if let Some(tunnel_key) = self.tunnel_key_for_caller(caller_addr) {
+        let now = Instant::now();
+        let tunnel_key = if let Some(mut entry) = self.dcid_to_sni.get_mut(dcid) {
+            let tunnel_key = entry.value().0.clone();
+            entry.value_mut().1 = now;
+            self.caller_to_tunnel
+                .insert(caller_addr, (tunnel_key.clone(), now));
+            tunnel_key
+        } else if let Some(tunnel_key) = self.tunnel_key_for_caller(caller_addr, now) {
             tunnel_key
         } else {
             warn!(dcid = %dcid, "no tunnel for DCID — dropping UDP datagram");
@@ -189,14 +211,16 @@ impl Router {
             return false;
         };
 
-        let Some(client_conn) = self.table.get(&tunnel_key).map(|e| e.clone()) else {
+        let Some(tunnel) = self.table.get(&tunnel_key).map(|e| Arc::clone(e.value())) else {
             warn!(dcid = %dcid, tunnel_key = %tunnel_key, "mapped UDP tunnel is not registered");
             self.total_rejected_datagrams
                 .fetch_add(1, Ordering::Relaxed);
             return false;
         };
 
-        let Some(session_id) = self.udp_session_id(&tunnel_key, ingress_port, caller_addr) else {
+        let Some(session_id) =
+            self.udp_session_id(&tunnel_key, ingress_port, caller_addr, &tunnel, now)
+        else {
             warn!(
                 dcid = %dcid,
                 tunnel_key = %tunnel_key,
@@ -212,7 +236,7 @@ impl Router {
         framed.extend_from_slice(&session_id.to_be_bytes());
         framed.extend_from_slice(datagram);
 
-        match client_conn.send_datagram(Bytes::from(framed)) {
+        match tunnel.conn.send_datagram(Bytes::from(framed)) {
             Ok(()) => {
                 self.total_ingress_bytes
                     .fetch_add((4 + datagram.len()) as u64, Ordering::Relaxed);
@@ -249,19 +273,49 @@ impl Router {
         public_port: u16,
         session_id: u16,
     ) -> Option<SocketAddr> {
-        self.udp_callers
-            .get(&(tunnel_key.to_string(), public_port, session_id))
-            .map(|e| *e)
+        let now = Instant::now();
+        let mut caller = None;
+        if let Some(mut entry) =
+            self.udp_callers
+                .get_mut(&(tunnel_key.to_string(), public_port, session_id))
+        {
+            entry.value_mut().1 = now;
+            caller = Some(entry.value().0);
+        }
+
+        let caller = caller?;
+        if let Some(mut entry) = self
+            .caller_to_session
+            .get_mut(&(tunnel_key.to_string(), caller))
+        {
+            entry.value_mut().1 = now;
+        }
+        Some(caller)
     }
 
     pub fn active_tunnels(&self) -> usize {
         self.table.len()
     }
 
-    fn tunnel_key_for_caller(&self, caller_addr: SocketAddr) -> Option<String> {
+    pub fn gc_udp_sessions(&self, max_idle: Duration) {
+        let now = Instant::now();
+        self.dcid_to_sni
+            .retain(|_, (_, last_seen)| now.duration_since(*last_seen) <= max_idle);
         self.udp_callers
-            .iter()
-            .find_map(|entry| (*entry.value() == caller_addr).then(|| entry.key().0.clone()))
+            .retain(|_, (_, last_seen)| now.duration_since(*last_seen) <= max_idle);
+        self.caller_to_tunnel
+            .retain(|_, (_, last_seen)| now.duration_since(*last_seen) <= max_idle);
+        self.caller_to_session
+            .retain(|_, (_, last_seen)| now.duration_since(*last_seen) <= max_idle);
+    }
+
+    fn tunnel_key_for_caller(&self, caller_addr: SocketAddr, now: Instant) -> Option<String> {
+        let entry = self.caller_to_tunnel.get(&caller_addr)?;
+        let (tunnel_key, last_authenticated) = entry.value();
+        if now.duration_since(*last_authenticated) > UDP_FALLBACK_WINDOW {
+            return None;
+        }
+        Some(tunnel_key.clone())
     }
 
     fn udp_session_id(
@@ -269,19 +323,22 @@ impl Router {
         tunnel_key: &str,
         public_port: u16,
         caller_addr: SocketAddr,
+        tunnel: &Tunnel,
+        now: Instant,
     ) -> Option<u16> {
-        if let Some(existing) = self.udp_callers.iter().find_map(|entry| {
-            let (entry_tunnel, entry_port, session_id) = entry.key();
-            (entry_tunnel == tunnel_key
-                && *entry_port == public_port
-                && *entry.value() == caller_addr)
-                .then_some(*session_id)
-        }) {
-            return Some(existing);
+        let session_key = (tunnel_key.to_string(), caller_addr);
+        if let Some(mut existing) = self.caller_to_session.get_mut(&session_key) {
+            let session_id = existing.value().0;
+            existing.value_mut().1 = now;
+            self.udp_callers.insert(
+                (tunnel_key.to_string(), public_port, session_id),
+                (caller_addr, now),
+            );
+            return Some(session_id);
         }
 
         for _ in 0..u16::MAX {
-            let session_id = self
+            let session_id = tunnel
                 .next_udp_session_id
                 .fetch_add(1, Ordering::Relaxed)
                 .wrapping_add(1);
@@ -292,7 +349,9 @@ impl Router {
             let key = (tunnel_key.to_string(), public_port, session_id);
             match self.udp_callers.entry(key) {
                 Entry::Vacant(entry) => {
-                    entry.insert(caller_addr);
+                    entry.insert((caller_addr, now));
+                    self.caller_to_session
+                        .insert(session_key, (session_id, now));
                     return Some(session_id);
                 }
                 Entry::Occupied(_) => {}
@@ -300,6 +359,17 @@ impl Router {
         }
 
         None
+    }
+
+    fn remove_udp_state_for_tunnel(&self, key: &str) {
+        self.dcid_to_sni
+            .retain(|_, (tunnel_key, _)| tunnel_key != key);
+        self.udp_callers
+            .retain(|(tunnel_key, _, _), _| tunnel_key != key);
+        self.caller_to_tunnel
+            .retain(|_, (tunnel_key, _)| tunnel_key != key);
+        self.caller_to_session
+            .retain(|(tunnel_key, _), _| tunnel_key != key);
     }
 }
 
@@ -310,7 +380,7 @@ mod tests {
     use quinn::{crypto::rustls::QuicClientConfig, ClientConfig, Endpoint, ServerConfig};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use std::net::{IpAddr, Ipv4Addr};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn new_router_is_empty() {
@@ -329,6 +399,81 @@ mod tests {
         router.total_egress_bytes.fetch_add(512, Ordering::Relaxed);
         assert_eq!(router.total_ingress_bytes.load(Ordering::Relaxed), 1024);
         assert_eq!(router.total_egress_bytes.load(Ordering::Relaxed), 512);
+    }
+
+    #[test]
+    fn caller_fallback_is_time_windowed() {
+        let router = Router::new();
+        let caller: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let now = Instant::now();
+
+        router.caller_to_tunnel.insert(
+            caller,
+            ("test.local".to_string(), now - Duration::from_secs(6)),
+        );
+        assert_eq!(router.tunnel_key_for_caller(caller, now), None);
+
+        router
+            .caller_to_tunnel
+            .insert(caller, ("test.local".to_string(), now));
+        assert_eq!(
+            router.tunnel_key_for_caller(caller, now),
+            Some("test.local".to_string())
+        );
+    }
+
+    #[test]
+    fn gc_udp_sessions_sweeps_idle_indexes() {
+        let router = Router::new();
+        let now = Instant::now();
+        let old = now - Duration::from_secs(601);
+        let fresh = now - Duration::from_secs(60);
+        let old_caller: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let fresh_caller: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+
+        router
+            .dcid_to_sni
+            .insert("old-dcid".to_string(), ("old.local".to_string(), old));
+        router
+            .dcid_to_sni
+            .insert("fresh-dcid".to_string(), ("fresh.local".to_string(), fresh));
+        router
+            .udp_callers
+            .insert(("old.local".to_string(), 443, 1), (old_caller, old));
+        router
+            .udp_callers
+            .insert(("fresh.local".to_string(), 443, 1), (fresh_caller, fresh));
+        router
+            .caller_to_tunnel
+            .insert(old_caller, ("old.local".to_string(), old));
+        router
+            .caller_to_tunnel
+            .insert(fresh_caller, ("fresh.local".to_string(), fresh));
+        router
+            .caller_to_session
+            .insert(("old.local".to_string(), old_caller), (1, old));
+        router
+            .caller_to_session
+            .insert(("fresh.local".to_string(), fresh_caller), (1, fresh));
+
+        router.gc_udp_sessions(Duration::from_secs(600));
+
+        assert!(!router.dcid_to_sni.contains_key("old-dcid"));
+        assert!(router.dcid_to_sni.contains_key("fresh-dcid"));
+        assert!(!router
+            .udp_callers
+            .contains_key(&("old.local".to_string(), 443, 1)));
+        assert!(router
+            .udp_callers
+            .contains_key(&("fresh.local".to_string(), 443, 1)));
+        assert!(!router.caller_to_tunnel.contains_key(&old_caller));
+        assert!(router.caller_to_tunnel.contains_key(&fresh_caller));
+        assert!(!router
+            .caller_to_session
+            .contains_key(&("old.local".to_string(), old_caller)));
+        assert!(router
+            .caller_to_session
+            .contains_key(&("fresh.local".to_string(), fresh_caller)));
     }
 
     #[tokio::test]
@@ -352,7 +497,12 @@ mod tests {
 
         assert_eq!(router.active_tunnels(), 1);
         assert_eq!(
-            router.table.get(&key).expect("active tunnel").stable_id(),
+            router
+                .table
+                .get(&key)
+                .expect("active tunnel")
+                .conn
+                .stable_id(),
             server_conn_2.stable_id()
         );
 
@@ -374,12 +524,70 @@ mod tests {
             .expect_err("insecure duplicate should be rejected");
         assert!(err.to_string().contains("already registered"));
         assert_eq!(
-            router.table.get(&key).expect("active tunnel").stable_id(),
+            router
+                .table
+                .get(&key)
+                .expect("active tunnel")
+                .conn
+                .stable_id(),
             server_conn_2.stable_id()
         );
 
         client_conn_1.close(quinn::VarInt::from_u32(0), b"test done");
         client_conn_2.close(quinn::VarInt::from_u32(0), b"test done");
+        server.close(quinn::VarInt::from_u32(0), b"test done");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_session_ids_are_per_tunnel_and_indexed_by_caller() -> Result<()> {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let server = test_server_endpoint()?;
+        let router = Router::new();
+        let key = "test.local".to_string();
+        let (_client_endpoint, client_conn, server_conn) = connect_pair(&server, &key).await?;
+        router.register(server_conn, Some(key.clone()), true)?;
+
+        let tunnel = Arc::clone(router.table.get(&key).expect("registered tunnel").value());
+        let now = Instant::now();
+        let caller_a: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let caller_b: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+
+        let first = router
+            .udp_session_id(&key, 443, caller_a, &tunnel, now)
+            .expect("first session");
+        let reused = router
+            .udp_session_id(&key, 443, caller_a, &tunnel, now)
+            .expect("reused session");
+        let second = router
+            .udp_session_id(&key, 443, caller_b, &tunnel, now)
+            .expect("second session");
+
+        assert_eq!(first, reused);
+        assert_ne!(first, second);
+        assert_eq!(
+            router
+                .caller_to_session
+                .get(&(key.clone(), caller_a))
+                .expect("caller index")
+                .value()
+                .0,
+            first
+        );
+        assert_eq!(
+            router
+                .udp_callers
+                .get(&(key.clone(), 443, first))
+                .expect("return path")
+                .value()
+                .0,
+            caller_a
+        );
+
+        client_conn.close(quinn::VarInt::from_u32(0), b"test done");
         server.close(quinn::VarInt::from_u32(0), b"test done");
         Ok(())
     }
